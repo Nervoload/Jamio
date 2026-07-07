@@ -1,0 +1,24 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "jamio-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-07",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "JAMIO_ROOM",
+        "class_name": "JamioRoom"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["JamioRoom"]
+    }
+  ],
+  "vars": {
+    "ENVIRONMENT": "development",
+    "ALLOWED_ORIGIN": "http://localhost:5173"
+  }
+}
