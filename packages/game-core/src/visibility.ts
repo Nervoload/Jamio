@@ -68,6 +68,9 @@ function getPrompt(state: GameState, playerId: PlayerId): PlayerPrompt {
     if (state.pendingPower.revealedTargets) {
       prompt.revealedTargets = state.pendingPower.revealedTargets;
     }
+    if (state.pendingPower.revealedAtVersion !== undefined) {
+      prompt.revealedAtVersion = state.pendingPower.revealedAtVersion;
+    }
     return prompt;
   }
   if (state.phase === "discard_reward" && state.pendingDiscardReward?.actorId === playerId) {

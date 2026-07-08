@@ -72,6 +72,7 @@ export function TableView({
   const powerPrompt = view?.pendingPrompt?.type === "resolve_power" ? view.pendingPrompt : null;
   const power = powerPrompt?.power ?? null;
   const revealedTargets = powerPrompt?.revealedTargets ?? [];
+  const revealedAtVersion = powerPrompt?.revealedAtVersion;
   const isViewingPower = revealedTargets.length > 0;
   const allCardTargets = useMemo(() => getAllCardTargets(view, currentPlayerId), [view, currentPlayerId]);
 
@@ -98,7 +99,7 @@ export function TableView({
       onAction({ type: "resolve_power", choice: { type: "end_reveal" } });
     }, lookRevealTimeoutMs);
     return () => window.clearTimeout(timeout);
-  }, [isViewingPower, onAction, view?.version]);
+  }, [isViewingPower, onAction, revealedAtVersion]);
 
   useLayoutEffect(() => {
     const nextRects = new Map<string, DOMRect>();

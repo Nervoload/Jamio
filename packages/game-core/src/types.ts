@@ -248,7 +248,7 @@ export type PublicPlayerView = PlayerState & {
 export type PlayerPrompt =
   | { type: "drawn_card_decision"; card: PublicCard }
   | { type: "select_replacement" }
-  | { type: "resolve_power"; power: CardPower; revealedTargets?: CardTarget[] }
+  | { type: "resolve_power"; power: CardPower; revealedTargets?: CardTarget[]; revealedAtVersion?: number }
   | { type: "discard_reward"; targetPlayerId: PlayerId }
   | null;
 
