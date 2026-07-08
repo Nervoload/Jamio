@@ -116,6 +116,8 @@ export type PendingPower = {
   cardId: CardId;
   power: CardPower;
   source: "drawn" | "hand";
+  revealedTargets?: CardTarget[];
+  revealedAtVersion?: number;
 };
 
 export type PendingDiscardReward = {
@@ -179,6 +181,7 @@ export type GameState = {
 
 export type PowerChoice =
   | { type: "cancel" }
+  | { type: "end_reveal" }
   | { type: "swap"; targets: [CardTarget, CardTarget] }
   | { type: "look_swap"; targets: [CardTarget, CardTarget]; swap: boolean }
   | { type: "reveal"; targets: CardTarget[] }
@@ -203,6 +206,7 @@ export type GameAction =
   | { type: "call_jamio" }
   | { type: "start_next_round"; randomSeed?: string | undefined }
   | { type: "end_game_now" }
+  | { type: "restart_game"; randomSeed?: string | undefined }
   | { type: "leave_table"; playerId?: PlayerId | undefined };
 
 export type LegalAction =
@@ -244,7 +248,7 @@ export type PublicPlayerView = PlayerState & {
 export type PlayerPrompt =
   | { type: "drawn_card_decision"; card: PublicCard }
   | { type: "select_replacement" }
-  | { type: "resolve_power"; power: CardPower }
+  | { type: "resolve_power"; power: CardPower; revealedTargets?: CardTarget[] }
   | { type: "discard_reward"; targetPlayerId: PlayerId }
   | null;
 

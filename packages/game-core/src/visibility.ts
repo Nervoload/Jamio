@@ -61,10 +61,14 @@ function getPrompt(state: GameState, playerId: PlayerId): PlayerPrompt {
     };
   }
   if (state.phase === "resolving_power" && state.pendingPower?.actorId === playerId) {
-    return {
+    const prompt: PlayerPrompt = {
       type: "resolve_power",
       power: state.pendingPower.power
     };
+    if (state.pendingPower.revealedTargets) {
+      prompt.revealedTargets = state.pendingPower.revealedTargets;
+    }
+    return prompt;
   }
   if (state.phase === "discard_reward" && state.pendingDiscardReward?.actorId === playerId) {
     return {

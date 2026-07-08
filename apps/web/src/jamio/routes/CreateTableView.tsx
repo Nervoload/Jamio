@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { jamioDefaultRuleset, validateRulesetForPlayers, type Ruleset } from "@jamio/game-core";
 import { RulesEditor } from "../components/RulesEditor";
 import { RoomCodeBadge } from "../components/RoomCodeBadge";
+import { useRoomCodeAvailability } from "../hooks/useRoomCodeAvailability";
 
 export type CreatedTable = {
   name: string;
@@ -12,18 +13,22 @@ export type CreatedTable = {
 };
 
 type CreateTableViewProps = {
-  onCreate: (table: CreatedTable) => void;
+  onCreate: (table: CreatedTable) => Promise<void> | void;
+  onPracticeLocal: (table: CreatedTable) => void;
   onBack: () => void;
 };
 
 const roomCodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
-export function CreateTableView({ onCreate, onBack }: CreateTableViewProps) {
+export function CreateTableView({ onCreate, onPracticeLocal, onBack }: CreateTableViewProps) {
   const [name, setName] = useState("");
   const [maxPlayers, setMaxPlayers] = useState(2);
   const [roomCode, setRoomCode] = useState(() => generateRoomCode());
   const [ruleset, setRuleset] = useState<Ruleset>(() => JSON.parse(JSON.stringify(jamioDefaultRuleset)) as Ruleset);
   const [theme, setTheme] = useState("classic");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const availability = useRoomCodeAvailability(roomCode);
 
   const validation = useMemo(() => {
     try {
@@ -34,23 +39,36 @@ export function CreateTableView({ onCreate, onBack }: CreateTableViewProps) {
     }
   }, [ruleset, maxPlayers]);
 
-  const canCreate = name.trim().length > 0 && roomCode.trim().length >= 3 && !validation;
+  const canCreate = name.trim().length > 0 && roomCode.trim().length >= 3 && !validation && availability.status !== "taken";
+
+  const table = useMemo(
+    () => ({
+      name: name.trim(),
+      roomCode: roomCode.trim().toUpperCase(),
+      maxPlayers,
+      ruleset,
+      theme
+    }),
+    [maxPlayers, name, roomCode, ruleset, theme]
+  );
 
   return (
     <form
       className="menu-panel create-panel"
-      onSubmit={(event) => {
+      onSubmit={async (event) => {
         event.preventDefault();
         if (!canCreate) {
           return;
         }
-        onCreate({
-          name: name.trim(),
-          roomCode: roomCode.trim().toUpperCase(),
-          maxPlayers,
-          ruleset,
-          theme
-        });
+        setIsSubmitting(true);
+        setSubmitError(null);
+        try {
+          await onCreate(table);
+        } catch (error) {
+          setSubmitError(error instanceof Error ? error.message : "Could not create the online table.");
+        } finally {
+          setIsSubmitting(false);
+        }
       }}
     >
       <button className="back-button" type="button" onClick={onBack}>
@@ -83,6 +101,7 @@ export function CreateTableView({ onCreate, onBack }: CreateTableViewProps) {
           <span>Table Theme</span>
           <select value={theme} onChange={(event) => setTheme(event.target.value)}>
             <option value="classic">Classic felt</option>
+            <option value="pink">Pink hearts</option>
             <option value="moonlit" disabled>
               Moonlit later
             </option>
@@ -104,16 +123,22 @@ export function CreateTableView({ onCreate, onBack }: CreateTableViewProps) {
       </label>
       <div id="room-code-status" className="availability-row">
         <RoomCodeBadge roomCode={roomCode || "ROOM"} />
-        <span>Availability check will use the room server; local preview treats this as available.</span>
+        <span className={`availability-text is-${availability.status}`}>{availability.message}</span>
       </div>
 
       <RulesEditor ruleset={ruleset} maxPlayers={maxPlayers} onChange={setRuleset} />
 
       {validation ? <p className="form-error">{validation}</p> : null}
+      {submitError ? <p className="form-error">{submitError}</p> : null}
 
-      <button className="submit-button" type="submit" disabled={!canCreate}>
-        Create Table
-      </button>
+      <div className="form-actions">
+        <button className="submit-button" type="submit" disabled={!canCreate || isSubmitting}>
+          {isSubmitting ? "Creating..." : "Create Online Table"}
+        </button>
+        <button className="secondary-submit-button" type="button" disabled={!canCreate} onClick={() => onPracticeLocal(table)}>
+          Practice Locally
+        </button>
+      </div>
     </form>
   );
 }

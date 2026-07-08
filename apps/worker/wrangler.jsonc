@@ -3,11 +3,21 @@
   "name": "jamio-worker",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-07",
+  "assets": {
+    "directory": "../web/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": true
+  },
   "durable_objects": {
     "bindings": [
       {
         "name": "JAMIO_ROOM",
         "class_name": "JamioRoom"
+      },
+      {
+        "name": "JAMIO_RATE_LIMIT",
+        "class_name": "JamioRateLimiter"
       }
     ]
   },
@@ -15,10 +25,74 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["JamioRoom"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["JamioRateLimiter"]
     }
   ],
   "vars": {
     "ENVIRONMENT": "development",
     "ALLOWED_ORIGIN": "http://localhost:5173"
+  },
+  "env": {
+    "production": {
+      "name": "jamio-worker",
+      "workers_dev": false,
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "JAMIO_ROOM",
+            "class_name": "JamioRoom"
+          },
+          {
+            "name": "JAMIO_RATE_LIMIT",
+            "class_name": "JamioRateLimiter"
+          }
+        ]
+      },
+      "routes": [
+        {
+          "pattern": "johnsurette.com/jamio*",
+          "zone_name": "johnsurette.com"
+        },
+        {
+          "pattern": "johnsurette.com/api/jamio/*",
+          "zone_name": "johnsurette.com"
+        }
+      ],
+      "vars": {
+        "ENVIRONMENT": "production",
+        "ALLOWED_ORIGIN": "https://johnsurette.com",
+        "PUBLIC_BASE_PATH": "/jamio/"
+      }
+    },
+    "subdomain": {
+      "name": "jamio-worker-subdomain",
+      "workers_dev": false,
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "JAMIO_ROOM",
+            "class_name": "JamioRoom"
+          },
+          {
+            "name": "JAMIO_RATE_LIMIT",
+            "class_name": "JamioRateLimiter"
+          }
+        ]
+      },
+      "routes": [
+        {
+          "pattern": "jamio.johnsurette.com",
+          "custom_domain": true
+        }
+      ],
+      "vars": {
+        "ENVIRONMENT": "production",
+        "ALLOWED_ORIGIN": "https://jamio.johnsurette.com",
+        "PUBLIC_BASE_PATH": "/"
+      }
+    }
   }
 }

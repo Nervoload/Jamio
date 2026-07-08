@@ -156,6 +156,75 @@ describe("Jamio game engine", () => {
     expect(state.pendingPower?.power.type).toBe("self_look");
   });
 
+  it("look powers keep cards revealed until ended", () => {
+    let state = makeState("look-hold");
+    state.currentTurnPlayerId = "p1";
+    const targetSlot = slot(state, "p2");
+    putCardInSlot(state, "p2", targetSlot, "AS");
+    putCardOnDeckTop(state, "9S");
+
+    state = applyAction(state, "p1", { type: "draw_from_deck" }).state;
+    state = applyAction(state, "p1", { type: "play_drawn_card" }).state;
+    state = applyAction(state, "p1", {
+      type: "resolve_power",
+      choice: { type: "reveal", targets: [{ playerId: "p2", slotId: targetSlot }] }
+    }).state;
+
+    expect(state.phase).toBe("resolving_power");
+    expect(state.pendingPower?.revealedTargets).toHaveLength(1);
+    expect(getPlayerView(state, "p1").opponentHands[0]!.cards[0]!.card?.id).toBe("AS");
+
+    state = applyAction(state, "p1", { type: "resolve_power", choice: { type: "end_reveal" } }).state;
+
+    expect(state.phase).toBe("turn_idle");
+    expect(state.currentTurnPlayerId).toBe("p2");
+    expect(getPlayerView(state, "p1").opponentHands[0]!.cards[0]!.card).toBeNull();
+  });
+
+  it("look and swap reveals before swapping selected cards", () => {
+    let state = makeState("look-swap");
+    state.currentTurnPlayerId = "p1";
+    const ownSlot = slot(state, "p1");
+    const opponentSlot = slot(state, "p2");
+    putCardInSlot(state, "p1", ownSlot, "AS");
+    putCardInSlot(state, "p2", opponentSlot, "KH");
+    putCardOnDeckTop(state, "QH");
+
+    state = applyAction(state, "p1", { type: "draw_from_deck" }).state;
+    state = applyAction(state, "p1", { type: "play_drawn_card" }).state;
+    state = applyAction(state, "p1", {
+      type: "resolve_power",
+      choice: {
+        type: "look_swap",
+        targets: [
+          { playerId: "p1", slotId: ownSlot },
+          { playerId: "p2", slotId: opponentSlot }
+        ],
+        swap: false
+      }
+    }).state;
+
+    expect(state.phase).toBe("resolving_power");
+    expect(getPlayerView(state, "p1").yourHand[0]!.card?.id).toBe("AS");
+    expect(getPlayerView(state, "p1").opponentHands[0]!.cards[0]!.card?.id).toBe("KH");
+
+    state = applyAction(state, "p1", {
+      type: "resolve_power",
+      choice: {
+        type: "look_swap",
+        targets: [
+          { playerId: "p1", slotId: ownSlot },
+          { playerId: "p2", slotId: opponentSlot }
+        ],
+        swap: true
+      }
+    }).state;
+
+    expect(state.phase).toBe("turn_idle");
+    expect(state.hands.p1!.find((card) => card.slotId === ownSlot)?.cardId).toBe("KH");
+    expect(state.hands.p2!.find((card) => card.slotId === opponentSlot)?.cardId).toBe("AS");
+  });
+
   it("hand card power triggers only if triggersFromHand is true", () => {
     let state = makeState("trigger-true");
     state.currentTurnPlayerId = "p1";
@@ -256,6 +325,30 @@ describe("Jamio game engine", () => {
     }).state;
 
     expect(state.hands.p1).toHaveLength(startingCount + 1);
+  });
+
+  it("can attempt a discard while a power is pending", () => {
+    let state = makeState("discard-during-power");
+    state.currentTurnPlayerId = "p1";
+    const matchingSlot = slot(state, "p2");
+    putCardInSlot(state, "p2", matchingSlot, "9H");
+    putCardOnDeckTop(state, "9S");
+
+    state = applyAction(state, "p1", { type: "draw_from_deck" }).state;
+    state = applyAction(state, "p1", { type: "play_drawn_card" }).state;
+
+    expect(state.phase).toBe("resolving_power");
+
+    state = applyAction(state, "p1", {
+      type: "attempt_discard",
+      targetPlayerId: "p2",
+      handSlotId: matchingSlot,
+      lastPlayedSeq: state.lastPlayedSeq
+    }).state;
+
+    expect(state.hands.p2!.some((card) => card.slotId === matchingSlot)).toBe(false);
+    expect(state.pendingPower?.power.type).toBe("look");
+    expect(state.phase).toBe("discard_reward");
   });
 
   it("discard window closes when next card is played and stale discard is rejected", () => {

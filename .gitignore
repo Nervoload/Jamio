@@ -1,6 +1,7 @@
 node_modules/
 dist/
 apps/*/dist/
+apps/*/dist-*/
 packages/*/dist/
 .wrangler/
 .DS_Store

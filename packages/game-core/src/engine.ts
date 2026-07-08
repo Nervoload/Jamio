@@ -245,6 +245,9 @@ export function applyAction(state: GameState, playerId: PlayerId, action: GameAc
       next = endGame(next);
       break;
     }
+    case "restart_game": {
+      throw new JamioError("Restart is handled by the room server", "ROOM_ACTION_ONLY");
+    }
     case "leave_table": {
       const leavingPlayerId = action.playerId ?? playerId;
       const player = next.players.find((candidate) => candidate.id === leavingPlayerId);
@@ -332,9 +335,6 @@ function canAttemptDiscard(state: GameState, playerId: PlayerId): boolean {
     return false;
   }
   if (state.phase === "round_reveal" || state.phase === "game_over" || state.phase === "initial_countdown") {
-    return false;
-  }
-  if (state.phase === "resolving_power" || state.phase === "discard_reward") {
     return false;
   }
   if (!state.ruleset.general.canDiscardOnOwnTurn && state.currentTurnPlayerId === playerId) {
@@ -477,9 +477,22 @@ function resolvePower(state: GameState, actorId: PlayerId, choice: PowerChoice):
   const pending = state.pendingPower;
   const power = pending.power;
 
+  if (choice.type === "end_reveal") {
+    assertJamio(isViewingLookPower(pending), "No revealed cards are waiting", "INVALID_POWER_CHOICE");
+    finishViewedPower(state, actorId, false);
+    return;
+  }
+
   if (choice.type === "cancel") {
     state.pendingPower = null;
     advanceTurn(state, actorId);
+    return;
+  }
+
+  if (isViewingLookPower(pending)) {
+    assertJamio(power.type === "look_swap", "End the reveal before resolving another power choice", "INVALID_POWER_CHOICE");
+    assertJamio(choice.type === "look_swap", "Look & Swap can only swap or end now", "INVALID_POWER_CHOICE");
+    finishViewedPower(state, actorId, choice.swap);
     return;
   }
 
@@ -492,30 +505,51 @@ function resolvePower(state: GameState, actorId: PlayerId, choice: PowerChoice):
     case "look_swap": {
       assertJamio(choice.type === "look_swap", "Look & Swap requires two targets", "INVALID_POWER_CHOICE");
       revealTargetsToActor(state, actorId, choice.targets);
-      if (choice.swap) {
-        swapTargets(state, choice.targets[0], choice.targets[1]);
-      }
-      break;
+      state.pendingPower = {
+        ...pending,
+        revealedTargets: choice.targets,
+        revealedAtVersion: state.version + 1
+      };
+      addEvent(state, "power_reveal", `${playerName(state, actorId)} is looking at two cards`, actorId);
+      return;
     }
     case "self_look": {
       assertJamio(choice.type === "reveal", "Self Look requires reveal targets", "INVALID_POWER_CHOICE");
       assertTargetCount(choice.targets, power.count);
       assertJamio(choice.targets.every((target) => target.playerId === actorId), "Self Look can only target your cards");
       revealTargetsToActor(state, actorId, choice.targets);
-      break;
+      state.pendingPower = {
+        ...pending,
+        revealedTargets: choice.targets,
+        revealedAtVersion: state.version + 1
+      };
+      addEvent(state, "power_reveal", `${playerName(state, actorId)} is looking at ${choice.targets.length} card(s)`, actorId);
+      return;
     }
     case "look": {
       assertJamio(choice.type === "reveal", "Look requires reveal targets", "INVALID_POWER_CHOICE");
       assertTargetCount(choice.targets, power.count);
       assertJamio(choice.targets.every((target) => target.playerId !== actorId), "Look can only target opponent cards");
       revealTargetsToActor(state, actorId, choice.targets);
-      break;
+      state.pendingPower = {
+        ...pending,
+        revealedTargets: choice.targets,
+        revealedAtVersion: state.version + 1
+      };
+      addEvent(state, "power_reveal", `${playerName(state, actorId)} is looking at ${choice.targets.length} card(s)`, actorId);
+      return;
     }
     case "universal_look": {
       assertJamio(choice.type === "reveal", "Universal Look requires reveal targets", "INVALID_POWER_CHOICE");
       assertTargetCount(choice.targets, power.count);
       revealTargetsToActor(state, actorId, choice.targets);
-      break;
+      state.pendingPower = {
+        ...pending,
+        revealedTargets: choice.targets,
+        revealedAtVersion: state.version + 1
+      };
+      addEvent(state, "power_reveal", `${playerName(state, actorId)} is looking at ${choice.targets.length} card(s)`, actorId);
+      return;
     }
     case "give": {
       assertJamio(choice.type === "give", "Give requires a target player", "INVALID_POWER_CHOICE");
@@ -560,6 +594,31 @@ function resolvePower(state: GameState, actorId: PlayerId, choice: PowerChoice):
   advanceTurn(state, actorId);
 }
 
+function isViewingLookPower(pending: NonNullable<GameState["pendingPower"]>): boolean {
+  return (
+    (pending.power.type === "self_look" || pending.power.type === "look" || pending.power.type === "universal_look" || pending.power.type === "look_swap") &&
+    Boolean(pending.revealedTargets?.length)
+  );
+}
+
+function finishViewedPower(state: GameState, actorId: PlayerId, shouldSwap: boolean): void {
+  const pending = state.pendingPower;
+  assertJamio(pending, "No power is pending", "INVALID_PHASE");
+  const revealedTargets = pending.revealedTargets ?? [];
+  assertJamio(revealedTargets.length > 0, "No revealed cards are waiting", "INVALID_POWER_CHOICE");
+
+  if (shouldSwap) {
+    assertJamio(pending.power.type === "look_swap", "Only Look & Swap can swap revealed cards", "INVALID_POWER_CHOICE");
+    assertJamio(revealedTargets.length === 2, "Look & Swap requires two revealed targets", "INVALID_POWER_CHOICE");
+    swapTargets(state, revealedTargets[0]!, revealedTargets[1]!);
+  }
+
+  hideTargetsFromActor(state, actorId, revealedTargets);
+  addEvent(state, "power_resolved", `${playerName(state, actorId)} resolved ${pending.power.type}`, actorId);
+  state.pendingPower = null;
+  advanceTurn(state, actorId);
+}
+
 function assertTargetCount(targets: CardTarget[], maxCount: number): void {
   assertJamio(targets.length > 0, "At least one target is required", "INVALID_POWER_CHOICE");
   assertJamio(targets.length <= maxCount, "Too many targets selected", "INVALID_POWER_CHOICE");
@@ -571,6 +630,16 @@ function revealTargetsToActor(state: GameState, actorId: PlayerId, targets: Card
     if (!handCard.visibleTo.includes(actorId)) {
       handCard.visibleTo.push(actorId);
     }
+  }
+}
+
+function hideTargetsFromActor(state: GameState, actorId: PlayerId, targets: CardTarget[]): void {
+  for (const target of targets) {
+    const handCard = maybeFindHandCard(state, target.playerId, target.slotId)?.handCard;
+    if (!handCard) {
+      continue;
+    }
+    handCard.visibleTo = handCard.visibleTo.filter((playerId) => playerId !== actorId);
   }
 }
 
@@ -645,6 +714,23 @@ function findHandCard(
   const handCard = hand[index];
   assertJamio(handCard, "Card slot does not exist", "CARD_NOT_FOUND");
   return { hand, handCard, index };
+}
+
+function maybeFindHandCard(
+  state: GameState,
+  playerId: PlayerId,
+  slotId: HandSlotId
+): { hand: HandCard[]; handCard: HandCard; index: number } | null {
+  const hand = state.hands[playerId];
+  if (!hand) {
+    return null;
+  }
+  const index = hand.findIndex((candidate) => candidate.slotId === slotId);
+  if (index < 0) {
+    return null;
+  }
+  const handCard = hand[index];
+  return handCard ? { hand, handCard, index } : null;
 }
 
 function advanceTurn(state: GameState, completedPlayerId: PlayerId): void {

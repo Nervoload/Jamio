@@ -4,7 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "WRANGLER_WRITE_LOGS=false wrangler deploy --dry-run --outdir dist",
+    "build": "WRANGLER_WRITE_LOGS=false wrangler deploy --dry-run --env= --outdir dist",
+    "build:production": "WRANGLER_WRITE_LOGS=false wrangler deploy --dry-run --env production --outdir dist-production",
+    "build:subdomain": "WRANGLER_WRITE_LOGS=false wrangler deploy --dry-run --env subdomain --outdir dist-subdomain",
+    "deploy:production": "wrangler deploy --env production",
+    "deploy:subdomain": "wrangler deploy --env subdomain",
     "dev": "wrangler dev",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

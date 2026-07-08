@@ -19,12 +19,14 @@ export type CreateRoomResponse = {
   roomCode: string;
   playerId: string;
   playerToken: string;
+  theme: string;
 };
 
 export type JoinRoomResponse = {
   roomCode: string;
   playerId: string;
   playerToken: string;
+  theme: string;
 };
 
 export type AvailabilityResponse = {

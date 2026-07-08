@@ -9,10 +9,14 @@
   ],
   "scripts": {
     "build": "npm run build -w @jamio/game-core && npm run build -w @jamio/protocol && npm run build -w @jamio/web && npm run build -w @jamio/worker",
+    "build:cloudflare:path": "npm run build -w @jamio/game-core && npm run build -w @jamio/protocol && JAMIO_BASE_PATH=/jamio/ npm run build -w @jamio/web && npm run build:production -w @jamio/worker",
+    "build:cloudflare:subdomain": "npm run build -w @jamio/game-core && npm run build -w @jamio/protocol && JAMIO_BASE_PATH=/ npm run build -w @jamio/web && npm run build:subdomain -w @jamio/worker",
     "test": "npm run test --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "dev:web": "npm run dev -w @jamio/web",
-    "dev:worker": "npm run dev -w @jamio/worker"
+    "dev:worker": "npm run dev -w @jamio/worker",
+    "deploy:cloudflare:path": "npm run build:cloudflare:path && npm run deploy:production -w @jamio/worker",
+    "deploy:cloudflare:subdomain": "npm run build:cloudflare:subdomain && npm run deploy:subdomain -w @jamio/worker"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260707.1",

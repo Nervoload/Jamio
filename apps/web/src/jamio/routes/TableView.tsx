@@ -1,15 +1,18 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type RefCallback } from "react";
 import type { CardPower, CardTarget, GameAction, Player, PlayerId, PlayerView, PublicCard } from "@jamio/game-core";
 import { Card } from "../components/Card";
 import { RoomCodeBadge } from "../components/RoomCodeBadge";
 import { Scoreboard } from "../components/Scoreboard";
 import type { CreatedTable } from "./CreateTableView";
 
-type LocalSession = {
+type TableSession = {
+  kind: "local" | "online";
   table: CreatedTable;
   players: Player[];
-  state: unknown;
   currentPlayerId: PlayerId;
+  state?: unknown;
+  connectionStatus?: string | null;
+  connectionError?: string | null;
 };
 
 type SelectionMode =
@@ -20,8 +23,16 @@ type SelectionMode =
   | "discard_reward"
   | "donate_cards";
 
+const doubleTapWindowMs = 420;
+const lookRevealTimeoutMs = 30_000;
+
+type TargetMotion = {
+  className: string;
+  style?: CSSProperties & Record<"--move-x" | "--move-y", string>;
+};
+
 type TableViewProps = {
-  session: LocalSession;
+  session: TableSession;
   view: PlayerView | null;
   currentPlayerId: PlayerId;
   onSwitchPlayer: (playerId: PlayerId) => void;
@@ -47,25 +58,88 @@ export function TableView({
   const [selectedTargets, setSelectedTargets] = useState<CardTarget[]>([]);
   const [donateTargetId, setDonateTargetId] = useState<PlayerId | null>(null);
   const [lastTap, setLastTap] = useState<{ key: string; at: number } | null>(null);
+  const [targetMotions, setTargetMotions] = useState<Record<string, TargetMotion>>({});
+  const [stackMotion, setStackMotion] = useState<"deck" | "discard" | null>(null);
+  const targetRefs = useRef(new Map<string, HTMLButtonElement>());
+  const cardMotionRefs = useRef(new Map<string, HTMLButtonElement>());
+  const previousCardRects = useRef(new Map<string, DOMRect>());
+  const targetMotionTimeout = useRef<number | null>(null);
+  const stackMotionTimeout = useRef<number | null>(null);
 
   const currentPlayer = session.players.find((player) => player.id === currentPlayerId) ?? session.players[0]!;
+  const isOnline = session.kind === "online";
   const latestEmote = [...(view?.eventLog ?? [])].reverse().find((event) => event.type === "power_emote");
-  const power = view?.pendingPrompt?.type === "resolve_power" ? view.pendingPrompt.power : null;
+  const powerPrompt = view?.pendingPrompt?.type === "resolve_power" ? view.pendingPrompt : null;
+  const power = powerPrompt?.power ?? null;
+  const revealedTargets = powerPrompt?.revealedTargets ?? [];
+  const isViewingPower = revealedTargets.length > 0;
+  const allCardTargets = useMemo(() => getAllCardTargets(view, currentPlayerId), [view, currentPlayerId]);
 
   useEffect(() => {
-    setMode("none");
     setSelectedTargets([]);
     setDonateTargetId(null);
+    const prompt = view?.pendingPrompt;
+    if (prompt?.type === "resolve_power" && isTargetingPower(prompt.power) && !prompt.revealedTargets?.length) {
+      setMode("power_targets");
+      return;
+    }
+    if (prompt?.type === "discard_reward") {
+      setMode("discard_reward");
+      return;
+    }
+    setMode("none");
   }, [currentPlayerId, view?.phase, view?.version]);
+
+  useEffect(() => {
+    if (!isViewingPower) {
+      return;
+    }
+    const timeout = window.setTimeout(() => {
+      onAction({ type: "resolve_power", choice: { type: "end_reveal" } });
+    }, lookRevealTimeoutMs);
+    return () => window.clearTimeout(timeout);
+  }, [isViewingPower, onAction, view?.version]);
+
+  useLayoutEffect(() => {
+    const nextRects = new Map<string, DOMRect>();
+    const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    for (const [cardId, node] of cardMotionRefs.current) {
+      const rect = node.getBoundingClientRect();
+      nextRects.set(cardId, rect);
+      const previousRect = previousCardRects.current.get(cardId);
+      if (!previousRect || prefersReducedMotion) {
+        continue;
+      }
+      const deltaX = previousRect.left - rect.left;
+      const deltaY = previousRect.top - rect.top;
+      if (Math.abs(deltaX) < 1 && Math.abs(deltaY) < 1) {
+        continue;
+      }
+      node.animate(
+        [
+          { transform: `translate(${deltaX}px, ${deltaY}px)` },
+          { transform: "translate(0, 0)" }
+        ],
+        {
+          duration: 420,
+          easing: "cubic-bezier(.2,.9,.2,1)"
+        }
+      );
+    }
+
+    previousCardRects.current = nextRects;
+  }, [view?.version, currentPlayerId]);
 
   const legal = useMemo(() => {
     return new Set(view?.legalActions.map((action) => action.type) ?? []);
   }, [view]);
 
-  if (!view) {
+  if (!view || view.phase === "lobby") {
     return (
       <LobbyView
         session={session}
+        view={view}
         currentPlayerId={currentPlayerId}
         onSwitchPlayer={onSwitchPlayer}
         onAddGuest={onAddGuest}
@@ -79,6 +153,87 @@ export function TableView({
   const canTakeDiscard = legal.has("take_discard_and_replace");
   const canCallJamio = legal.has("call_jamio");
 
+  function registerTargetElement(target: CardTarget): RefCallback<HTMLButtonElement> {
+    const key = targetKey(target);
+    return (node) => {
+      if (node) {
+        targetRefs.current.set(key, node);
+      } else {
+        targetRefs.current.delete(key);
+      }
+    };
+  }
+
+  function registerCardMotionElement(card: PublicCard | null): RefCallback<HTMLButtonElement> {
+    const cardId = card?.id;
+    return (node) => {
+      if (!cardId) {
+        return;
+      }
+      if (node) {
+        cardMotionRefs.current.set(cardId, node);
+      } else {
+        cardMotionRefs.current.delete(cardId);
+      }
+    };
+  }
+
+  function setTemporaryTargetMotions(nextMotions: Record<string, TargetMotion>, duration = 560) {
+    if (targetMotionTimeout.current) {
+      window.clearTimeout(targetMotionTimeout.current);
+    }
+    setTargetMotions(nextMotions);
+    targetMotionTimeout.current = window.setTimeout(() => {
+      setTargetMotions({});
+      targetMotionTimeout.current = null;
+    }, duration);
+  }
+
+  function setTemporaryStackMotion(stack: "deck" | "discard", duration = 520) {
+    if (stackMotionTimeout.current) {
+      window.clearTimeout(stackMotionTimeout.current);
+    }
+    setStackMotion(stack);
+    stackMotionTimeout.current = window.setTimeout(() => {
+      setStackMotion(null);
+      stackMotionTimeout.current = null;
+    }, duration);
+  }
+
+  function markTargets(targets: CardTarget[], className: string) {
+    const motions = Object.fromEntries(targets.map((target) => [targetKey(target), { className }]));
+    setTemporaryTargetMotions(motions);
+  }
+
+  function markSwapTargets(targets: [CardTarget, CardTarget]) {
+    const firstKey = targetKey(targets[0]);
+    const secondKey = targetKey(targets[1]);
+    const firstRect = targetRefs.current.get(firstKey)?.getBoundingClientRect();
+    const secondRect = targetRefs.current.get(secondKey)?.getBoundingClientRect();
+
+    if (!firstRect || !secondRect) {
+      markTargets(targets, "is-moving");
+      return;
+    }
+
+    setTemporaryTargetMotions({
+      [firstKey]: {
+        className: "is-swapping",
+        style: {
+          "--move-x": `${secondRect.left - firstRect.left}px`,
+          "--move-y": `${secondRect.top - firstRect.top}px`
+        }
+      },
+      [secondKey]: {
+        className: "is-swapping",
+        style: {
+          "--move-x": `${firstRect.left - secondRect.left}px`,
+          "--move-y": `${firstRect.top - secondRect.top}px`
+        }
+      }
+    });
+  }
+
   function dispatch(action: GameAction) {
     setMode("none");
     setSelectedTargets([]);
@@ -88,16 +243,21 @@ export function TableView({
 
   function handleCardClick(target: CardTarget) {
     if (mode === "replace_drawn" && target.playerId === currentPlayerId) {
+      markTargets([target], "is-replacing");
+      setTemporaryStackMotion("discard");
       dispatch({ type: "replace_with_drawn_card", handSlotId: target.slotId });
       return;
     }
 
     if (mode === "take_discard" && target.playerId === currentPlayerId) {
+      markTargets([target], "is-replacing");
+      setTemporaryStackMotion("discard");
       dispatch({ type: "take_discard_and_replace", handSlotId: target.slotId });
       return;
     }
 
     if (mode === "discard_reward" && target.playerId === currentPlayerId) {
+      markTargets([target], "is-donating");
       dispatch({ type: "resolve_discard_reward", handSlotIdToDonate: target.slotId });
       return;
     }
@@ -107,7 +267,19 @@ export function TableView({
     }
 
     if (power.type === "donate" && mode === "donate_cards" && target.playerId === currentPlayerId) {
-      setSelectedTargets((current) => toggleTarget(current, target).slice(0, power.count));
+      const nextTargets = toggleTarget(selectedTargets, target).slice(0, power.count);
+      setSelectedTargets(nextTargets);
+      if (donateTargetId && nextTargets.length >= getRequiredTargetCount(power, currentPlayerId, allCardTargets)) {
+        markTargets(nextTargets, "is-donating");
+        dispatch({
+          type: "resolve_power",
+          choice: {
+            type: "donate",
+            targetPlayerId: donateTargetId,
+            handSlotIds: nextTargets.map((candidate) => candidate.slotId)
+          }
+        });
+      }
       return;
     }
 
@@ -116,13 +288,18 @@ export function TableView({
     }
 
     const maxTargets = getPowerTargetCount(power);
-    setSelectedTargets((current) => toggleTarget(current, target).slice(0, maxTargets));
+    const nextTargets = toggleTarget(selectedTargets, target).slice(0, maxTargets);
+    setSelectedTargets(nextTargets);
+
+    if (nextTargets.length >= getRequiredTargetCount(power, currentPlayerId, allCardTargets)) {
+      resolvePowerTargets(power, nextTargets);
+    }
   }
 
   function handleCardTap(target: CardTarget) {
     const key = `${target.playerId}:${target.slotId}`;
     const now = Date.now();
-    if (lastTap?.key === key && now - lastTap.at < 420) {
+    if (lastTap?.key === key && now - lastTap.at < doubleTapWindowMs) {
       attemptDiscard(target);
       setLastTap(null);
       return;
@@ -131,9 +308,10 @@ export function TableView({
   }
 
   function attemptDiscard(target: CardTarget) {
-    if (!view?.lastPlayedSeq || mode !== "none") {
+    if (!view?.lastPlayedSeq || !legal.has("attempt_discard")) {
       return;
     }
+    markTargets([target], "is-discarding");
     dispatch({
       type: "attempt_discard",
       targetPlayerId: target.playerId,
@@ -142,93 +320,101 @@ export function TableView({
     });
   }
 
-  function resolveSelectedPower(choiceOverride?: "swap" | "cancel") {
-    if (!power) {
-      return;
-    }
-
-    if (choiceOverride === "cancel") {
-      dispatch({ type: "resolve_power", choice: { type: "cancel" } });
-      return;
-    }
-
-    if (power.type === "swap" && selectedTargets.length === 2) {
+  function resolvePowerTargets(activePower: CardPower, targets: CardTarget[]) {
+    if (activePower.type === "swap" && targets.length === 2) {
+      markSwapTargets(targets as [CardTarget, CardTarget]);
       dispatch({
         type: "resolve_power",
-        choice: { type: "swap", targets: selectedTargets as [CardTarget, CardTarget] }
+        choice: { type: "swap", targets: targets as [CardTarget, CardTarget] }
       });
       return;
     }
 
-    if (power.type === "look_swap" && selectedTargets.length === 2) {
+    if (activePower.type === "look_swap" && targets.length === 2) {
+      markTargets(targets, "is-revealing");
       dispatch({
         type: "resolve_power",
         choice: {
           type: "look_swap",
-          targets: selectedTargets as [CardTarget, CardTarget],
-          swap: choiceOverride === "swap"
+          targets: targets as [CardTarget, CardTarget],
+          swap: false
         }
       });
       return;
     }
 
-    if (power.type === "self_look" || power.type === "look" || power.type === "universal_look") {
-      if (selectedTargets.length > 0) {
-        dispatch({
-          type: "resolve_power",
-          choice: { type: "reveal", targets: selectedTargets }
-        });
-      }
+    if (activePower.type === "self_look" || activePower.type === "look" || activePower.type === "universal_look") {
+      markTargets(targets, "is-revealing");
+      dispatch({
+        type: "resolve_power",
+        choice: { type: "reveal", targets }
+      });
       return;
     }
 
-    if (power.type === "burn" && selectedTargets.length > 0) {
+    if (activePower.type === "burn" && targets.length > 0) {
+      markTargets(targets, "is-burning");
       dispatch({
         type: "resolve_power",
-        choice: { type: "burn", targets: selectedTargets }
+        choice: { type: "burn", targets }
       });
     }
   }
 
-  function resolveDonate() {
-    if (!power || power.type !== "donate" || !donateTargetId || selectedTargets.length === 0) {
+  function finishViewedPower(shouldSwap = false) {
+    if (!power) {
       return;
     }
-    dispatch({
-      type: "resolve_power",
-      choice: {
-        type: "donate",
-        targetPlayerId: donateTargetId,
-        handSlotIds: selectedTargets.map((target) => target.slotId)
-      }
-    });
+    if (shouldSwap && power.type === "look_swap" && revealedTargets.length === 2) {
+      markSwapTargets(revealedTargets as [CardTarget, CardTarget]);
+      dispatch({
+        type: "resolve_power",
+        choice: {
+          type: "look_swap",
+          targets: revealedTargets as [CardTarget, CardTarget],
+          swap: true
+        }
+      });
+      return;
+    }
+    dispatch({ type: "resolve_power", choice: { type: "end_reveal" } });
   }
 
   return (
-    <main className="table-screen">
+    <main className={tableScreenClass(session.table.theme)}>
       {latestEmote ? <div className="emote-overlay" aria-live="polite">{latestEmote.message.replace(/^.* played /, "")}</div> : null}
 
       <header className="table-topbar">
         <div>
-          <p className="eyebrow">Local hotseat table</p>
+          <p className="eyebrow">{isOnline ? "Online room" : "Local hotseat table"}</p>
           <h1>Jamio Table</h1>
         </div>
         <div className="topbar-cluster">
-          <label className="viewer-select">
-            <span>Viewing as</span>
-            <select value={currentPlayerId} onChange={(event) => onSwitchPlayer(event.target.value)}>
-              {session.players.map((player) => (
-                <option key={player.id} value={player.id}>
-                  {player.name}
-                </option>
-              ))}
-            </select>
-          </label>
+          {isOnline ? (
+            <div className="connection-pill">
+              <span>{session.connectionStatus ?? "connecting"}</span>
+              <strong>{currentPlayer.name}</strong>
+            </div>
+          ) : (
+            <label className="viewer-select">
+              <span>Viewing as</span>
+              <select value={currentPlayerId} onChange={(event) => onSwitchPlayer(event.target.value)}>
+                {session.players.map((player) => (
+                  <option key={player.id} value={player.id}>
+                    {player.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           <RoomCodeBadge roomCode={session.table.roomCode} />
         </div>
       </header>
 
+      {session.connectionError ? <div className="connection-error">{session.connectionError}</div> : null}
+
       <section className="table-layout">
+        {isPinkTheme(session.table.theme) ? <HeartSprinkles seed={session.table.roomCode} /> : null}
         <div className="status-banner">
           <strong>{phaseCopy(view.phase)}</strong>
           <span>{statusCopy(view, currentPlayer.name)}</span>
@@ -243,18 +429,26 @@ export function TableView({
                   <span>{player?.name ?? hand.playerId}</span>
                   <strong>{hand.cards.length} cards</strong>
                 </div>
-                <div className="mini-cards-row">
-                  {hand.cards.map((handCard) => (
-                    <CardButton
-                      key={handCard.slotId}
-                      card={handCard.card}
-                      target={{ playerId: hand.playerId, slotId: handCard.slotId }}
-                      selectable={isSelectable(mode, power, currentPlayerId, { playerId: hand.playerId, slotId: handCard.slotId })}
-                      selected={isSelected(selectedTargets, { playerId: hand.playerId, slotId: handCard.slotId })}
-                      onClick={handleCardClick}
-                      onTap={handleCardTap}
-                    />
-                  ))}
+                <div className="mini-cards-grid" style={gridColumnsStyle(hand.cards.length)}>
+                  {hand.cards.map((handCard) => {
+                    const target = { playerId: hand.playerId, slotId: handCard.slotId };
+                    const motion = targetMotions[targetKey(target)];
+                    return (
+                      <CardButton
+                        key={handCard.slotId}
+                        card={handCard.card}
+                        target={target}
+                        selectable={isSelectable(mode, power, currentPlayerId, target)}
+                        selected={isSelected(selectedTargets, target)}
+                        motionClassName={motion?.className}
+                        motionStyle={motion?.style}
+                        targetRef={registerTargetElement(target)}
+                        cardMotionRef={registerCardMotionElement(handCard.card)}
+                        onClick={handleCardClick}
+                        onTap={handleCardTap}
+                      />
+                    );
+                  })}
                 </div>
               </div>
             );
@@ -262,13 +456,21 @@ export function TableView({
         </div>
 
         <div className="center-stacks" aria-label="table center">
-          <button className={`stack deck-stack ${canDraw ? "is-actionable" : ""}`} type="button" disabled={!canDraw} onClick={() => dispatch({ type: "draw_from_deck" })}>
+          <button
+            className={`stack deck-stack ${canDraw ? "is-actionable" : ""} ${stackMotion === "deck" ? "is-drawing" : ""}`}
+            type="button"
+            disabled={!canDraw}
+            onClick={() => {
+              setTemporaryStackMotion("deck");
+              dispatch({ type: "draw_from_deck" });
+            }}
+          >
             <Card card={null} />
             <strong>Deck</strong>
             <span>{view.deckCount} cards</span>
           </button>
           <button
-            className={`stack played-stack ${canTakeDiscard ? "is-actionable" : ""}`}
+            className={`stack played-stack ${canTakeDiscard ? "is-actionable" : ""} ${stackMotion === "discard" ? "is-receiving" : ""}`}
             type="button"
             disabled={!canTakeDiscard}
             onClick={() => setMode("take_discard")}
@@ -284,6 +486,7 @@ export function TableView({
           mode={mode}
           power={power}
           selectedTargets={selectedTargets}
+          revealedTargets={revealedTargets}
           donateTargetId={donateTargetId}
           currentPlayerId={currentPlayerId}
           canCallJamio={canCallJamio}
@@ -294,9 +497,13 @@ export function TableView({
             setSelectedTargets([]);
             setMode("donate_cards");
           }}
-          onResolveSelectedPower={resolveSelectedPower}
-          onResolveDonate={resolveDonate}
-          onAction={dispatch}
+          onFinishViewedPower={finishViewedPower}
+          onAction={(action) => {
+            if (action.type === "play_drawn_card") {
+              setTemporaryStackMotion("discard");
+            }
+            dispatch(action);
+          }}
         />
 
         <div className="player-hand">
@@ -304,24 +511,32 @@ export function TableView({
             <span>{currentPlayer.name}</span>
             <small>{modeCopy(mode, view.lastPlayedSeq)}</small>
           </div>
-          <div className="cards-row">
-            {view.yourHand.map((handCard) => (
-              <CardButton
-                key={handCard.slotId}
-                card={handCard.card}
-                target={{ playerId: currentPlayerId, slotId: handCard.slotId }}
-                selectable={isSelectable(mode, power, currentPlayerId, { playerId: currentPlayerId, slotId: handCard.slotId })}
-                selected={isSelected(selectedTargets, { playerId: currentPlayerId, slotId: handCard.slotId })}
-                onClick={handleCardClick}
-                onTap={handleCardTap}
-              />
-            ))}
+          <div className="cards-grid" style={gridColumnsStyle(view.yourHand.length)}>
+            {view.yourHand.map((handCard) => {
+              const target = { playerId: currentPlayerId, slotId: handCard.slotId };
+              const motion = targetMotions[targetKey(target)];
+              return (
+                <CardButton
+                  key={handCard.slotId}
+                  card={handCard.card}
+                  target={target}
+                  selectable={isSelectable(mode, power, currentPlayerId, target)}
+                  selected={isSelected(selectedTargets, target)}
+                  motionClassName={motion?.className}
+                  motionStyle={motion?.style}
+                  targetRef={registerTargetElement(target)}
+                  cardMotionRef={registerCardMotionElement(handCard.card)}
+                  onClick={handleCardClick}
+                  onTap={handleCardTap}
+                />
+              );
+            })}
           </div>
         </div>
       </section>
 
       {view.phase === "round_reveal" || view.phase === "game_over" ? (
-        <RevealPanel view={view} hostPlayerId={session.players[0]!.id} currentPlayerId={currentPlayerId} onAction={dispatch} onRestartFromZero={onRestartFromZero} />
+        <RevealPanel view={view} hostPlayerId={view.hostPlayerId} currentPlayerId={currentPlayerId} onAction={dispatch} onRestartFromZero={onRestartFromZero} />
       ) : null}
 
       <Scoreboard view={view} />
@@ -334,7 +549,8 @@ export function TableView({
 }
 
 type LobbyViewProps = {
-  session: LocalSession;
+  session: TableSession;
+  view: PlayerView | null;
   currentPlayerId: PlayerId;
   onSwitchPlayer: (playerId: PlayerId) => void;
   onAddGuest: () => void;
@@ -342,39 +558,57 @@ type LobbyViewProps = {
   onLeave: () => void;
 };
 
-function LobbyView({ session, currentPlayerId, onSwitchPlayer, onAddGuest, onStartGame, onLeave }: LobbyViewProps) {
-  const canStart = session.players.length >= 2;
+function LobbyView({ session, view, currentPlayerId, onSwitchPlayer, onAddGuest, onStartGame, onLeave }: LobbyViewProps) {
+  const players = view?.players.map((player) => ({ id: player.id, name: player.name })) ?? session.players;
+  const isOnline = session.kind === "online";
+  const isHost = view ? view.hostPlayerId === currentPlayerId : currentPlayerId === session.players[0]?.id;
+  const canStart = players.length >= 2 && isHost;
   return (
-    <main className="table-screen">
+    <main className={tableScreenClass(session.table.theme)}>
       <header className="table-topbar">
         <div>
-          <p className="eyebrow">Lobby</p>
+          <p className="eyebrow">{isOnline ? "Online lobby" : "Lobby"}</p>
           <h1>Jamio Table</h1>
         </div>
-        <RoomCodeBadge roomCode={session.table.roomCode} />
+        <div className="topbar-cluster">
+          {isOnline ? (
+            <div className="connection-pill">
+              <span>{session.connectionStatus ?? "connecting"}</span>
+              <strong>{session.connectionError ? "Needs attention" : "Connected seat"}</strong>
+            </div>
+          ) : null}
+          <RoomCodeBadge roomCode={session.table.roomCode} />
+        </div>
       </header>
+      {session.connectionError ? <div className="connection-error">{session.connectionError}</div> : null}
       <section className="lobby-card">
         <div className="panel-heading">
           <p className="eyebrow">Waiting table</p>
           <h2>Players</h2>
         </div>
         <div className="lobby-player-list">
-          {session.players.map((player, index) => (
+          {players.map((player, index) => (
             <button
               className={`lobby-player ${currentPlayerId === player.id ? "is-current" : ""}`}
               key={player.id}
               type="button"
-              onClick={() => onSwitchPlayer(player.id)}
+              onClick={() => {
+                if (!isOnline) {
+                  onSwitchPlayer(player.id);
+                }
+              }}
             >
               <span>{player.name}</span>
-              <strong>{index === 0 ? "Host" : "Seat"}</strong>
+              <strong>{player.id === view?.hostPlayerId || (!view && index === 0) ? "Host" : "Seat"}</strong>
             </button>
           ))}
         </div>
         <div className="lobby-actions">
-          <button type="button" onClick={onAddGuest} disabled={session.players.length >= session.table.maxPlayers}>
-            Add Local Guest
-          </button>
+          {!isOnline ? (
+            <button type="button" onClick={onAddGuest} disabled={session.players.length >= session.table.maxPlayers}>
+              Add Local Guest
+            </button>
+          ) : null}
           <button type="button" onClick={onStartGame} disabled={!canStart}>
             Start Game
           </button>
@@ -382,10 +616,92 @@ function LobbyView({ session, currentPlayerId, onSwitchPlayer, onAddGuest, onSta
             Leave
           </button>
         </div>
-        {!canStart ? <p className="muted-note">Add a second local player to test a real round before the online client is wired in.</p> : null}
+        {!canStart ? (
+          <p className="muted-note">
+            {isOnline
+              ? isHost
+                ? "Share the room code and wait for another player to join."
+                : "Waiting for the host to start the game."
+              : "Add a second local player to test a real round."}
+          </p>
+        ) : null}
       </section>
     </main>
   );
+}
+
+function tableScreenClass(theme: string): string {
+  return `table-screen ${isPinkTheme(theme) ? "theme-pink" : "theme-classic"}`;
+}
+
+function isPinkTheme(theme: string): boolean {
+  return theme === "pink";
+}
+
+type HeartSprinkle = {
+  id: string;
+  x: number;
+  y: number;
+  size: number;
+  rotation: number;
+  color: string;
+  opacity: number;
+};
+
+const heartColors = ["#ff5ca8", "#ff8fc4", "#f83f92", "#ffbed9", "#d71b72", "#ffffff"];
+
+function HeartSprinkles({ seed }: { seed: string }) {
+  const hearts = useMemo(() => makeHeartSprinkles(seed), [seed]);
+  return (
+    <div className="heart-sprinkles" aria-hidden="true">
+      {hearts.map((heart) => (
+        <span
+          className="heart-sprinkle"
+          key={heart.id}
+          style={
+            {
+              left: `${heart.x}%`,
+              top: `${heart.y}%`,
+              color: heart.color,
+              fontSize: `${heart.size}px`,
+              opacity: heart.opacity,
+              transform: `rotate(${heart.rotation}deg)`
+            } satisfies CSSProperties
+          }
+        >
+          {"\u2665"}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function makeHeartSprinkles(seed: string): HeartSprinkle[] {
+  const random = seededRandom(seed || "pink");
+  return Array.from({ length: 34 }, (_, index) => ({
+    id: `heart-${index}`,
+    x: 3 + random() * 94,
+    y: 4 + random() * 90,
+    size: 14 + random() * 38,
+    rotation: -22 + random() * 44,
+    color: heartColors[Math.floor(random() * heartColors.length)]!,
+    opacity: 0.14 + random() * 0.26
+  }));
+}
+
+function seededRandom(seed: string): () => number {
+  let state = 2166136261;
+  for (let index = 0; index < seed.length; index += 1) {
+    state ^= seed.charCodeAt(index);
+    state = Math.imul(state, 16777619);
+  }
+  return () => {
+    state += 0x6d2b79f5;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
 }
 
 type ActionPanelProps = {
@@ -393,14 +709,14 @@ type ActionPanelProps = {
   mode: SelectionMode;
   power: CardPower | null;
   selectedTargets: CardTarget[];
+  revealedTargets: CardTarget[];
   donateTargetId: PlayerId | null;
   currentPlayerId: PlayerId;
   canCallJamio: boolean;
   players: Player[];
   onModeChange: (mode: SelectionMode) => void;
   onDonateTargetChange: (playerId: PlayerId) => void;
-  onResolveSelectedPower: (choice?: "swap" | "cancel") => void;
-  onResolveDonate: () => void;
+  onFinishViewedPower: (swap?: boolean) => void;
   onAction: (action: GameAction) => void;
 };
 
@@ -409,18 +725,20 @@ function ActionPanel({
   mode,
   power,
   selectedTargets,
+  revealedTargets,
   donateTargetId,
   currentPlayerId,
   canCallJamio,
   players,
   onModeChange,
   onDonateTargetChange,
-  onResolveSelectedPower,
-  onResolveDonate,
+  onFinishViewedPower,
   onAction
 }: ActionPanelProps) {
   const drawnCard = view.pendingPrompt?.type === "drawn_card_decision" ? view.pendingPrompt.card : null;
   const discardReward = view.pendingPrompt?.type === "discard_reward" ? view.pendingPrompt : null;
+  const isViewingPower = Boolean(power && revealedTargets.length > 0);
+  const canCancelSelection = mode === "replace_drawn" || mode === "take_discard";
 
   return (
     <div className="table-actions">
@@ -444,8 +762,7 @@ function ActionPanel({
 
       {power ? (
         <div className="power-panel">
-          <strong>{powerLabel(power)} power</strong>
-          <p>{powerHelp(power)}</p>
+          <strong>{powerInstruction(power, selectedTargets, revealedTargets)}</strong>
           {power.type === "give" ? (
             <div className="inline-actions">
               {players
@@ -464,6 +781,7 @@ function ActionPanel({
 
           {power.type === "donate" ? (
             <>
+              <p>{donateTargetId ? "Tap your highlighted card to donate it." : "Choose who receives the donated card."}</p>
               <div className="inline-actions">
                 {players
                   .filter((player) => player.id !== currentPlayerId)
@@ -478,33 +796,18 @@ function ActionPanel({
                     </button>
                   ))}
               </div>
-              <button type="button" disabled={!donateTargetId || selectedTargets.length === 0} onClick={onResolveDonate}>
-                Donate selected
-              </button>
             </>
           ) : null}
 
-          {power.type !== "give" && power.type !== "donate" ? (
+          {isViewingPower ? (
             <div className="inline-actions">
-              <button type="button" onClick={() => onModeChange("power_targets")}>
-                Select Targets
-              </button>
-              {power.type === "look_swap" && selectedTargets.length === 2 ? (
-                <>
-                  <button type="button" onClick={() => onResolveSelectedPower("swap")}>
-                    Look & Swap
-                  </button>
-                  <button type="button" onClick={() => onResolveSelectedPower()}>
-                    Just Look
-                  </button>
-                </>
-              ) : (
-                <button type="button" disabled={!canResolvePower(power, selectedTargets)} onClick={() => onResolveSelectedPower()}>
-                  Resolve Selected
+              {power.type === "look_swap" ? (
+                <button type="button" onClick={() => onFinishViewedPower(true)}>
+                  Swap
                 </button>
-              )}
-              <button type="button" onClick={() => onResolveSelectedPower("cancel")}>
-                Skip
+              ) : null}
+              <button type="button" onClick={() => onFinishViewedPower(false)}>
+                End Turn
               </button>
             </div>
           ) : null}
@@ -513,11 +816,7 @@ function ActionPanel({
 
       {discardReward ? (
         <div className="power-panel">
-          <strong>Discard reward</strong>
-          <p>Choose one of your cards to donate to the player you correctly discarded from.</p>
-          <button type="button" onClick={() => onModeChange("discard_reward")}>
-            Select Donation Card
-          </button>
+          <strong>Tap one of your highlighted cards to donate it.</strong>
         </div>
       ) : null}
 
@@ -525,7 +824,7 @@ function ActionPanel({
         <button type="button" disabled={!canCallJamio} onClick={() => onAction({ type: "call_jamio" })}>
           Call Jamio
         </button>
-        {mode !== "none" ? (
+        {canCancelSelection ? (
           <button type="button" onClick={() => onModeChange("none")}>
             Cancel Selection
           </button>
@@ -588,20 +887,42 @@ type CardButtonProps = {
   target: CardTarget;
   selectable: boolean;
   selected: boolean;
+  motionClassName?: string | undefined;
+  motionStyle?: TargetMotion["style"] | undefined;
+  targetRef: RefCallback<HTMLButtonElement>;
+  cardMotionRef: RefCallback<HTMLButtonElement>;
   onClick: (target: CardTarget) => void;
   onTap: (target: CardTarget) => void;
 };
 
-function CardButton({ card, target, selectable, selected, onClick, onTap }: CardButtonProps) {
+function CardButton({
+  card,
+  target,
+  selectable,
+  selected,
+  motionClassName,
+  motionStyle,
+  targetRef,
+  cardMotionRef,
+  onClick,
+  onTap
+}: CardButtonProps) {
   return (
     <button
-      className={`card-button ${selectable ? "is-selectable" : ""} ${selected ? "is-selected" : ""}`}
+      ref={(node) => {
+        targetRef(node);
+        cardMotionRef(node);
+      }}
+      className={`card-button ${selectable ? "is-selectable" : ""} ${selected ? "is-selected" : ""} ${motionClassName ?? ""}`}
+      style={motionStyle}
       type="button"
       onClick={() => {
+        if (selectable) {
+          onClick(target);
+          return;
+        }
         onTap(target);
-        onClick(target);
       }}
-      onDoubleClick={() => onTap(target)}
     >
       <Card card={card} />
     </button>
@@ -616,6 +937,17 @@ function isSelectable(mode: SelectionMode, power: CardPower | null, currentPlaye
     return isValidPowerTarget(power, target, currentPlayerId);
   }
   return false;
+}
+
+function isTargetingPower(power: CardPower): boolean {
+  return (
+    power.type === "swap" ||
+    power.type === "look_swap" ||
+    power.type === "self_look" ||
+    power.type === "look" ||
+    power.type === "universal_look" ||
+    power.type === "burn"
+  );
 }
 
 function isValidPowerTarget(power: CardPower, target: CardTarget, currentPlayerId: PlayerId): boolean {
@@ -634,6 +966,23 @@ function isValidPowerTarget(power: CardPower, target: CardTarget, currentPlayerI
   }
 }
 
+function getRequiredTargetCount(power: CardPower, currentPlayerId: PlayerId, allTargets: CardTarget[]): number {
+  if (power.type === "swap" || power.type === "look_swap") {
+    return 2;
+  }
+
+  if (power.type === "donate") {
+    return Math.min(power.count, allTargets.filter((target) => target.playerId === currentPlayerId).length);
+  }
+
+  const maxTargets = getPowerTargetCount(power);
+  if (maxTargets === 0) {
+    return 0;
+  }
+  const validTargets = allTargets.filter((target) => isValidPowerTarget(power, target, currentPlayerId)).length;
+  return Math.min(maxTargets, validTargets);
+}
+
 function getPowerTargetCount(power: CardPower): number {
   if (power.type === "swap" || power.type === "look_swap") {
     return 2;
@@ -644,14 +993,24 @@ function getPowerTargetCount(power: CardPower): number {
   return 0;
 }
 
-function canResolvePower(power: CardPower, selectedTargets: CardTarget[]): boolean {
-  if (power.type === "swap" || power.type === "look_swap") {
-    return selectedTargets.length === 2;
+function getAllCardTargets(view: PlayerView | null, currentPlayerId: PlayerId): CardTarget[] {
+  if (!view) {
+    return [];
   }
-  if (power.type === "self_look" || power.type === "look" || power.type === "universal_look" || power.type === "burn") {
-    return selectedTargets.length > 0;
-  }
-  return false;
+  return [
+    ...view.yourHand.map((card) => ({ playerId: currentPlayerId, slotId: card.slotId })),
+    ...view.opponentHands.flatMap((hand) => hand.cards.map((card) => ({ playerId: hand.playerId, slotId: card.slotId })))
+  ];
+}
+
+function gridColumnsStyle(cardCount: number): CSSProperties {
+  return {
+    gridTemplateColumns: `repeat(${Math.max(1, Math.ceil(cardCount / 2))}, minmax(0, max-content))`
+  };
+}
+
+function targetKey(target: CardTarget): string {
+  return `${target.playerId}:${target.slotId}`;
 }
 
 function toggleTarget(current: CardTarget[], target: CardTarget): CardTarget[] {
@@ -669,53 +1028,40 @@ function sameTarget(first: CardTarget, second: CardTarget): boolean {
   return first.playerId === second.playerId && first.slotId === second.slotId;
 }
 
-function powerLabel(power: CardPower): string {
-  switch (power.type) {
-    case "swap":
-      return "Swap";
-    case "look_swap":
-      return "Look & Swap";
-    case "self_look":
-      return `Self Look ${power.count}`;
-    case "look":
-      return `Look ${power.count}`;
-    case "universal_look":
-      return `Universal Look ${power.count}`;
-    case "give":
-      return `Give ${power.count}`;
-    case "donate":
-      return `Donate ${power.count}`;
-    case "burn":
-      return `Burn ${power.count}`;
-    case "draw":
-      return `Draw ${power.count}`;
-    case "emote":
-      return `Emote ${power.value}`;
+function powerInstruction(power: CardPower, selectedTargets: CardTarget[], revealedTargets: CardTarget[]): string {
+  if (revealedTargets.length > 0) {
+    if (power.type === "look_swap") {
+      return "Cards are revealed. Swap them or end your turn.";
+    }
+    return "Cards are revealed. Memorize them, then end your turn.";
   }
-}
 
-function powerHelp(power: CardPower): string {
+  const remaining = Math.max(0, getPowerTargetCount(power) - selectedTargets.length);
   switch (power.type) {
     case "swap":
-      return "Select any two cards to swap blindly.";
+      return remaining === 1 ? "Tap one more highlighted card to swap." : "Tap two highlighted cards to swap.";
     case "look_swap":
-      return "Select any two cards, then choose whether to swap them.";
+      return remaining === 1 ? "Tap one more highlighted card to reveal." : "Tap two highlighted cards to reveal.";
     case "self_look":
-      return "Select your own card or cards to privately reveal.";
+      return "Tap one highlighted card to look at it.";
     case "look":
-      return "Select opponent cards to privately reveal.";
-    case "universal_look":
-      return "Select any card or cards to privately reveal.";
+      return "Tap one opponent card to look at it.";
+    case "universal_look": {
+      const count = remaining || power.count;
+      return `Tap ${count} highlighted card${count === 1 ? "" : "s"} to look.`;
+    }
     case "give":
-      return "Choose another player to receive blind cards from the deck.";
+      return "Choose who receives the drawn card.";
     case "donate":
-      return "Choose another player, then select your own cards to donate.";
-    case "burn":
-      return "Select cards to burn back into the deck.";
+      return "Choose a player, then tap a highlighted card to donate.";
+    case "burn": {
+      const count = remaining || power.count;
+      return `Tap ${count} highlighted card${count === 1 ? "" : "s"} to burn.`;
+    }
     case "draw":
-      return "Draw resolved automatically.";
+      return "Drawing extra card.";
     case "emote":
-      return "Emote resolved automatically.";
+      return "Emote played.";
   }
 }
 

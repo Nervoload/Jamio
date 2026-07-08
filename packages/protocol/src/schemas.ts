@@ -52,6 +52,7 @@ const CardTargetSchema = z.object({
 
 const PowerChoiceSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("cancel") }),
+  z.object({ type: z.literal("end_reveal") }),
   z.object({ type: z.literal("swap"), targets: z.tuple([CardTargetSchema, CardTargetSchema]) }),
   z.object({
     type: z.literal("look_swap"),
@@ -89,6 +90,7 @@ export const GameActionSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("call_jamio") }),
   z.object({ type: z.literal("start_next_round"), randomSeed: z.string().optional() }),
   z.object({ type: z.literal("end_game_now") }),
+  z.object({ type: z.literal("restart_game"), randomSeed: z.string().optional() }),
   z.object({ type: z.literal("leave_table"), playerId: z.string().optional() })
 ]);
 

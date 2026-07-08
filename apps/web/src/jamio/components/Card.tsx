@@ -10,7 +10,7 @@ export function Card({ card }: CardProps) {
   if (!card) {
     return (
       <div className="playing-card card-back" aria-label="Hidden card">
-        <span>J</span>
+        <span>A + J</span>
       </div>
     );
   }
