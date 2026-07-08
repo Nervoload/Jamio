@@ -45,6 +45,11 @@ function putCardOnDeckTop(state: GameState, cardId: CardId): void {
 function putCardInSlot(state: GameState, playerId: PlayerId, slotId: HandSlotId, cardId: CardId): void {
   const handCard = state.hands[playerId]!.find((candidate) => candidate.slotId === slotId)!;
   const oldCardId = handCard.cardId;
+  if (!oldCardId) {
+    handCard.cardId = cardId;
+    handCard.visibleTo = [];
+    return;
+  }
   for (const hand of Object.values(state.hands)) {
     for (const candidate of hand) {
       if (candidate !== handCard && candidate.cardId === cardId) {
@@ -84,11 +89,16 @@ function playNoPowerCard(state: GameState, playerId: PlayerId): GameState {
   return applyAction(drawn, playerId, { type: "play_drawn_card" }).state;
 }
 
+function occupiedCount(state: GameState, playerId: PlayerId): number {
+  return state.hands[playerId]!.filter((handCard) => handCard.cardId).length;
+}
+
 describe("Jamio game engine", () => {
   it("deals unique cards", () => {
     const state = makeState();
     const dealt = Object.values(state.hands)
       .flat()
+      .filter((card) => card.cardId)
       .map((card) => card.cardId);
     expect(new Set(dealt).size).toBe(dealt.length);
   });
@@ -123,11 +133,23 @@ describe("Jamio game engine", () => {
     const replacedCard = state.hands.p1![0]!.cardId;
     putCardOnDeckTop(state, "AS");
 
-    state = applyAction(state, "p1", { type: "draw_from_deck" }).state;
-    state = applyAction(state, "p1", { type: "replace_with_drawn_card", handSlotId: targetSlot }).state;
+    const drawResult = applyAction(state, "p1", { type: "draw_from_deck" });
+    state = drawResult.state;
+    const replaceResult = applyAction(state, "p1", { type: "replace_with_drawn_card", handSlotId: targetSlot });
+    state = replaceResult.state;
 
     expect(state.hands.p1!.find((card) => card.slotId === targetSlot)?.cardId).toBe("AS");
     expect(state.discardPile.at(-1)).toBe(replacedCard);
+    expect(drawResult.events.find((event) => event.type === "draw")).toMatchObject({
+      source: "deck",
+      destination: "hand",
+      targetPlayerId: "p1"
+    });
+    expect(replaceResult.events.find((event) => event.type === "replace_card")).toMatchObject({
+      target: { playerId: "p1", slotId: targetSlot },
+      source: "drawn",
+      destination: "hand"
+    });
   });
 
   it("taking played-stack card replaces a hand card", () => {
@@ -192,7 +214,7 @@ describe("Jamio game engine", () => {
 
     state = applyAction(state, "p1", { type: "draw_from_deck" }).state;
     state = applyAction(state, "p1", { type: "play_drawn_card" }).state;
-    state = applyAction(state, "p1", {
+    const revealResult = applyAction(state, "p1", {
       type: "resolve_power",
       choice: {
         type: "look_swap",
@@ -202,13 +224,21 @@ describe("Jamio game engine", () => {
         ],
         swap: false
       }
-    }).state;
+    });
+    state = revealResult.state;
 
     expect(state.phase).toBe("resolving_power");
     expect(getPlayerView(state, "p1").yourHand[0]!.card?.id).toBe("AS");
     expect(getPlayerView(state, "p1").opponentHands[0]!.cards[0]!.card?.id).toBe("KH");
+    expect(revealResult.events.find((event) => event.type === "power_reveal")).toMatchObject({
+      targets: [
+        { playerId: "p1", slotId: ownSlot },
+        { playerId: "p2", slotId: opponentSlot }
+      ],
+      source: "power"
+    });
 
-    state = applyAction(state, "p1", {
+    const swapResult = applyAction(state, "p1", {
       type: "resolve_power",
       choice: {
         type: "look_swap",
@@ -218,11 +248,20 @@ describe("Jamio game engine", () => {
         ],
         swap: true
       }
-    }).state;
+    });
+    state = swapResult.state;
 
     expect(state.phase).toBe("turn_idle");
     expect(state.hands.p1!.find((card) => card.slotId === ownSlot)?.cardId).toBe("KH");
     expect(state.hands.p2!.find((card) => card.slotId === opponentSlot)?.cardId).toBe("AS");
+    expect(swapResult.events.find((event) => event.type === "swap_cards")).toMatchObject({
+      targets: [
+        { playerId: "p1", slotId: ownSlot },
+        { playerId: "p2", slotId: opponentSlot }
+      ],
+      source: "power",
+      destination: "hand"
+    });
   });
 
   it("hand card power triggers only if triggersFromHand is true", () => {
@@ -258,23 +297,25 @@ describe("Jamio game engine", () => {
     let state = makeState();
     putCardInSlot(state, "p1", slot(state, "p1"), "AS");
     openDiscardWindow(state, "AH", "A");
-    const startingCount = state.hands.p1!.length;
+    const targetSlot = slot(state, "p1");
+    const startingCount = occupiedCount(state, "p1");
 
     state = applyAction(state, "p1", {
       type: "attempt_discard",
       targetPlayerId: "p1",
-      handSlotId: slot(state, "p1"),
+      handSlotId: targetSlot,
       lastPlayedSeq: state.lastPlayedSeq
     }).state;
 
-    expect(state.hands.p1).toHaveLength(startingCount - 1);
+    expect(occupiedCount(state, "p1")).toBe(startingCount - 1);
+    expect(state.hands.p1!.find((card) => card.slotId === targetSlot)?.cardId).toBeNull();
   });
 
   it("incorrect own discard adds penalty card when enabled", () => {
     let state = makeState();
     putCardInSlot(state, "p1", slot(state, "p1"), "2S");
     openDiscardWindow(state, "AH", "A");
-    const startingCount = state.hands.p1!.length;
+    const startingCount = occupiedCount(state, "p1");
 
     state = applyAction(state, "p1", {
       type: "attempt_discard",
@@ -283,7 +324,7 @@ describe("Jamio game engine", () => {
       lastPlayedSeq: state.lastPlayedSeq
     }).state;
 
-    expect(state.hands.p1).toHaveLength(startingCount + 1);
+    expect(occupiedCount(state, "p1")).toBe(startingCount + 1);
   });
 
   it("correct opponent discard requires donation", () => {
@@ -302,20 +343,27 @@ describe("Jamio game engine", () => {
     expect(state.phase).toBe("discard_reward");
     expect(state.pendingDiscardReward?.targetPlayerId).toBe("p2");
 
-    state = applyAction(state, "p1", {
+    const rewardResult = applyAction(state, "p1", {
       type: "resolve_discard_reward",
       handSlotIdToDonate: actorDonateSlot
-    }).state;
+    });
+    state = rewardResult.state;
 
     expect(state.phase).toBe("turn_idle");
-    expect(state.hands.p2).toHaveLength(4);
+    expect(occupiedCount(state, "p2")).toBe(4);
+    expect(rewardResult.events.find((event) => event.type === "discard_reward")).toMatchObject({
+      targets: expect.arrayContaining([{ playerId: "p1", slotId: actorDonateSlot }]),
+      targetPlayerId: "p2",
+      source: "hand",
+      destination: "hand"
+    });
   });
 
   it("incorrect opponent discard adds penalty card when enabled", () => {
     let state = makeState();
     putCardInSlot(state, "p2", slot(state, "p2"), "2S");
     openDiscardWindow(state, "AH", "A");
-    const startingCount = state.hands.p1!.length;
+    const startingCount = occupiedCount(state, "p1");
 
     state = applyAction(state, "p1", {
       type: "attempt_discard",
@@ -324,7 +372,7 @@ describe("Jamio game engine", () => {
       lastPlayedSeq: state.lastPlayedSeq
     }).state;
 
-    expect(state.hands.p1).toHaveLength(startingCount + 1);
+    expect(occupiedCount(state, "p1")).toBe(startingCount + 1);
   });
 
   it("can attempt a discard while a power is pending", () => {
@@ -346,7 +394,7 @@ describe("Jamio game engine", () => {
       lastPlayedSeq: state.lastPlayedSeq
     }).state;
 
-    expect(state.hands.p2!.some((card) => card.slotId === matchingSlot)).toBe(false);
+    expect(state.hands.p2!.find((card) => card.slotId === matchingSlot)?.cardId).toBeNull();
     expect(state.pendingPower?.power.type).toBe("look");
     expect(state.phase).toBe("discard_reward");
   });

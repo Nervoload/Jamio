@@ -7,6 +7,7 @@ import type {
   ApplyActionResult,
   Card,
   CardId,
+  CardPower,
   CardTarget,
   GameAction,
   GameEvent,
@@ -29,6 +30,12 @@ export type InitialRoundOptions = {
   roundNumber?: number;
   nextRoundPenaltyCards?: Record<PlayerId, number>;
 };
+
+type GameEventDetails = Partial<
+  Pick<GameEvent, "target" | "targets" | "targetPlayerId" | "source" | "destination" | "count">
+>;
+
+type OccupiedHandCard = HandCard & { cardId: CardId };
 
 export function createInitialRound(
   players: Player[],
@@ -108,7 +115,7 @@ export function createInitialRound(
 
 export function getLegalActions(state: GameState, playerId: PlayerId): LegalAction[] {
   const actions: LegalAction[] = [];
-  const ownHand = state.hands[playerId] ?? [];
+  const ownHand = occupiedHandCards(state, playerId);
   const isCurrentPlayer = state.currentTurnPlayerId === playerId;
   const canUseTurnAction =
     isCurrentPlayer && (state.phase === "turn_idle" || state.phase === "jamio_final_cycle");
@@ -178,7 +185,12 @@ export function applyAction(state: GameState, playerId: PlayerId, action: GameAc
       const cardId = drawOne(next);
       next.drawnCard = { cardId, drawnBy: playerId, source: "deck" };
       next.phase = "drawn_card_decision";
-      addEvent(next, "draw", `${playerName(next, playerId)} drew from the deck`, playerId);
+      addEvent(next, "draw", `${playerName(next, playerId)} drew from the deck`, playerId, undefined, {
+        source: "deck",
+        destination: "hand",
+        targetPlayerId: playerId,
+        count: 1
+      });
       break;
     }
     case "play_drawn_card": {
@@ -186,7 +198,7 @@ export function applyAction(state: GameState, playerId: PlayerId, action: GameAc
       assertJamio(next.drawnCard?.drawnBy === playerId, "This is not your drawn card", "NOT_YOUR_DRAWN_CARD");
       const cardId = next.drawnCard.cardId;
       next.drawnCard = null;
-      playCardToDiscard(next, playerId, cardId);
+      playCardToDiscard(next, playerId, cardId, "drawn");
       maybeTriggerPowerOrAdvance(next, playerId, cardId, "drawn");
       break;
     }
@@ -196,7 +208,12 @@ export function applyAction(state: GameState, playerId: PlayerId, action: GameAc
       const drawnCardId = next.drawnCard.cardId;
       const replaced = replaceHandCard(next, playerId, action.handSlotId, drawnCardId);
       next.drawnCard = null;
-      playCardToDiscard(next, playerId, replaced.cardId);
+      addEvent(next, "replace_card", `${playerName(next, playerId)} replaced one of their cards`, playerId, undefined, {
+        target: { playerId, slotId: action.handSlotId },
+        source: "drawn",
+        destination: "hand"
+      });
+      playCardToDiscard(next, playerId, replaced.cardId, "hand");
       maybeTriggerPowerOrAdvance(next, playerId, replaced.cardId, "hand");
       break;
     }
@@ -206,7 +223,12 @@ export function applyAction(state: GameState, playerId: PlayerId, action: GameAc
       const takenCardId = next.discardPile.pop();
       assertJamio(takenCardId, "The played stack is empty", "EMPTY_DISCARD");
       const replaced = replaceHandCard(next, playerId, action.handSlotId, takenCardId);
-      playCardToDiscard(next, playerId, replaced.cardId);
+      addEvent(next, "replace_card", `${playerName(next, playerId)} took the played card`, playerId, undefined, {
+        target: { playerId, slotId: action.handSlotId },
+        source: "discard",
+        destination: "hand"
+      });
+      playCardToDiscard(next, playerId, replaced.cardId, "hand");
       maybeTriggerPowerOrAdvance(next, playerId, replaced.cardId, "hand");
       break;
     }
@@ -278,6 +300,9 @@ export function scoreRound(state: GameState): {
       .map((player) => [
         player.id,
         (state.hands[player.id] ?? []).reduce((total, handCard) => {
+          if (!handCard.cardId) {
+            return total;
+          }
           const card = getCard(state, handCard.cardId);
           return total + getCardRule(card, state.ruleset).points;
         }, 0)
@@ -353,32 +378,48 @@ function attemptDiscard(
   assertJamio(canAttemptDiscard(state, actorId), "Discard is not allowed now", "DISCARD_NOT_ALLOWED");
   assertJamio(state.lastPlayed?.seq === lastPlayedSeq, "Discard window is stale", "STALE_DISCARD_WINDOW");
 
-  const target = findHandCard(state, targetPlayerId, handSlotId);
+  const target = findOccupiedHandCard(state, targetPlayerId, handSlotId);
   const targetCard = getCard(state, target.handCard.cardId);
   const targetRule = getCardRule(targetCard, state.ruleset);
   const isCorrect = targetRule.matchGroup === state.lastPlayed.matchGroup;
 
   if (targetPlayerId === actorId) {
     if (isCorrect) {
-      target.hand.splice(target.index, 1);
-      addEvent(state, "discard_correct", `${playerName(state, actorId)} discarded their own ${targetRule.matchGroup}`, actorId);
+      removeHandCard(state, targetPlayerId, handSlotId);
+      addEvent(state, "discard_correct", `${playerName(state, actorId)} discarded their own ${targetRule.matchGroup}`, actorId, undefined, {
+        target: { playerId: targetPlayerId, slotId: handSlotId },
+        targetPlayerId,
+        source: "hand",
+        destination: "discard"
+      });
       maybeAutoJamio(state, actorId);
       return;
     }
     drawMistakePenalty(state, actorId);
-    addEvent(state, "discard_mistake", `${playerName(state, actorId)} missed a discard`, actorId);
+    addEvent(state, "discard_mistake", `${playerName(state, actorId)} missed a discard`, actorId, undefined, {
+      target: { playerId: targetPlayerId, slotId: handSlotId },
+      targetPlayerId,
+      source: "hand"
+    });
     return;
   }
 
   if (isCorrect) {
-    target.hand.splice(target.index, 1);
+    removeHandCard(state, targetPlayerId, handSlotId);
     addEvent(
       state,
       "opponent_discard_correct",
       `${playerName(state, actorId)} discarded a card from ${playerName(state, targetPlayerId)}`,
-      actorId
+      actorId,
+      undefined,
+      {
+        target: { playerId: targetPlayerId, slotId: handSlotId },
+        targetPlayerId,
+        source: "hand",
+        destination: "discard"
+      }
     );
-    if ((state.hands[actorId] ?? []).length > 0) {
+    if (occupiedHandCards(state, actorId).length > 0) {
       state.pendingDiscardReward = {
         actorId,
         targetPlayerId,
@@ -391,7 +432,11 @@ function attemptDiscard(
   }
 
   drawMistakePenalty(state, actorId);
-  addEvent(state, "opponent_discard_mistake", `${playerName(state, actorId)} missed an opponent discard`, actorId);
+  addEvent(state, "opponent_discard_mistake", `${playerName(state, actorId)} missed an opponent discard`, actorId, undefined, {
+    target: { playerId: targetPlayerId, slotId: handSlotId },
+    targetPlayerId,
+    source: "hand"
+  });
 }
 
 function resolveDiscardReward(state: GameState, actorId: PlayerId, handSlotId: HandSlotId): void {
@@ -399,19 +444,30 @@ function resolveDiscardReward(state: GameState, actorId: PlayerId, handSlotId: H
   assertJamio(state.pendingDiscardReward?.actorId === actorId, "This discard reward is not yours", "NOT_YOUR_REWARD");
   const reward = state.pendingDiscardReward;
   const donated = removeHandCard(state, actorId, handSlotId);
-  addHandCard(state, reward.targetPlayerId, donated.cardId);
+  const added = addHandCard(state, reward.targetPlayerId, donated.cardId);
   state.pendingDiscardReward = null;
   state.phase = reward.resumePhase;
   addEvent(
     state,
     "discard_reward",
     `${playerName(state, actorId)} donated a replacement card to ${playerName(state, reward.targetPlayerId)}`,
-    actorId
+    actorId,
+    undefined,
+    {
+      targets: [
+        { playerId: actorId, slotId: handSlotId },
+        { playerId: reward.targetPlayerId, slotId: added.slotId }
+      ],
+      targetPlayerId: reward.targetPlayerId,
+      source: "hand",
+      destination: "hand",
+      count: 1
+    }
   );
   maybeAutoJamio(state, actorId);
 }
 
-function playCardToDiscard(state: GameState, playerId: PlayerId, cardId: CardId): void {
+function playCardToDiscard(state: GameState, playerId: PlayerId, cardId: CardId, source: "drawn" | "hand"): void {
   state.discardPile.push(cardId);
   state.cardsPlayedThisRound += 1;
   if (state.lastPlayed) {
@@ -428,7 +484,11 @@ function playCardToDiscard(state: GameState, playerId: PlayerId, cardId: CardId)
     openedAtVersion: state.version,
     closed: false
   };
-  addEvent(state, "play_card", `${playerName(state, playerId)} played ${card.label}`, playerId, cardId);
+  addEvent(state, "play_card", `${playerName(state, playerId)} played ${card.label}`, playerId, cardId, {
+    source,
+    destination: "discard",
+    targetPlayerId: playerId
+  });
 }
 
 function maybeTriggerPowerOrAdvance(
@@ -447,10 +507,18 @@ function maybeTriggerPowerOrAdvance(
   }
 
   if (rule.power.type === "draw") {
+    const targets: CardTarget[] = [];
     for (let count = 0; count < rule.power.count; count += 1) {
-      addHandCard(state, actorId, drawOne(state));
+      const added = addHandCard(state, actorId, drawOne(state));
+      targets.push({ playerId: actorId, slotId: added.slotId });
     }
-    addEvent(state, "power_draw", `${playerName(state, actorId)} resolved Draw ${rule.power.count}`, actorId);
+    addEvent(state, "power_draw", `${playerName(state, actorId)} used Draw ${rule.power.count}`, actorId, undefined, {
+      targets,
+      targetPlayerId: actorId,
+      source: "deck",
+      destination: "hand",
+      count: rule.power.count
+    });
     advanceTurn(state, actorId);
     return;
   }
@@ -468,7 +536,7 @@ function maybeTriggerPowerOrAdvance(
     source
   };
   state.phase = "resolving_power";
-  addEvent(state, "power_pending", `${playerName(state, actorId)} is resolving ${rule.power.type}`, actorId);
+  addEvent(state, "power_pending", `${playerName(state, actorId)} used ${powerName(rule.power)}`, actorId);
 }
 
 function resolvePower(state: GameState, actorId: PlayerId, choice: PowerChoice): void {
@@ -500,6 +568,11 @@ function resolvePower(state: GameState, actorId: PlayerId, choice: PowerChoice):
     case "swap": {
       assertJamio(choice.type === "swap", "Swap requires two targets", "INVALID_POWER_CHOICE");
       swapTargets(state, choice.targets[0], choice.targets[1]);
+      addEvent(state, "swap_cards", `${playerName(state, actorId)} swapped two cards`, actorId, undefined, {
+        targets: choice.targets,
+        source: "power",
+        destination: "hand"
+      });
       break;
     }
     case "look_swap": {
@@ -510,7 +583,11 @@ function resolvePower(state: GameState, actorId: PlayerId, choice: PowerChoice):
         revealedTargets: choice.targets,
         revealedAtVersion: state.version + 1
       };
-      addEvent(state, "power_reveal", `${playerName(state, actorId)} is looking at two cards`, actorId);
+      addEvent(state, "power_reveal", `${playerName(state, actorId)} is looking at two cards`, actorId, undefined, {
+        targets: choice.targets,
+        source: "power",
+        count: choice.targets.length
+      });
       return;
     }
     case "self_look": {
@@ -523,7 +600,11 @@ function resolvePower(state: GameState, actorId: PlayerId, choice: PowerChoice):
         revealedTargets: choice.targets,
         revealedAtVersion: state.version + 1
       };
-      addEvent(state, "power_reveal", `${playerName(state, actorId)} is looking at ${choice.targets.length} card(s)`, actorId);
+      addEvent(state, "power_reveal", `${playerName(state, actorId)} is looking at ${choice.targets.length} card(s)`, actorId, undefined, {
+        targets: choice.targets,
+        source: "power",
+        count: choice.targets.length
+      });
       return;
     }
     case "look": {
@@ -536,7 +617,11 @@ function resolvePower(state: GameState, actorId: PlayerId, choice: PowerChoice):
         revealedTargets: choice.targets,
         revealedAtVersion: state.version + 1
       };
-      addEvent(state, "power_reveal", `${playerName(state, actorId)} is looking at ${choice.targets.length} card(s)`, actorId);
+      addEvent(state, "power_reveal", `${playerName(state, actorId)} is looking at ${choice.targets.length} card(s)`, actorId, undefined, {
+        targets: choice.targets,
+        source: "power",
+        count: choice.targets.length
+      });
       return;
     }
     case "universal_look": {
@@ -548,15 +633,28 @@ function resolvePower(state: GameState, actorId: PlayerId, choice: PowerChoice):
         revealedTargets: choice.targets,
         revealedAtVersion: state.version + 1
       };
-      addEvent(state, "power_reveal", `${playerName(state, actorId)} is looking at ${choice.targets.length} card(s)`, actorId);
+      addEvent(state, "power_reveal", `${playerName(state, actorId)} is looking at ${choice.targets.length} card(s)`, actorId, undefined, {
+        targets: choice.targets,
+        source: "power",
+        count: choice.targets.length
+      });
       return;
     }
     case "give": {
       assertJamio(choice.type === "give", "Give requires a target player", "INVALID_POWER_CHOICE");
       assertActivePlayer(state, choice.targetPlayerId);
+      const targets: CardTarget[] = [];
       for (let count = 0; count < power.count; count += 1) {
-        addHandCard(state, choice.targetPlayerId, drawOne(state));
+        const added = addHandCard(state, choice.targetPlayerId, drawOne(state));
+        targets.push({ playerId: choice.targetPlayerId, slotId: added.slotId });
       }
+      addEvent(state, "power_give", `${playerName(state, actorId)} gave ${power.count} card(s) to ${playerName(state, choice.targetPlayerId)}`, actorId, undefined, {
+        targets,
+        targetPlayerId: choice.targetPlayerId,
+        source: "deck",
+        destination: "hand",
+        count: power.count
+      });
       break;
     }
     case "donate": {
@@ -566,7 +664,17 @@ function resolvePower(state: GameState, actorId: PlayerId, choice: PowerChoice):
       assertJamio(choice.handSlotIds.length <= power.count, "Too many cards selected", "INVALID_POWER_CHOICE");
       for (const slotId of choice.handSlotIds) {
         const handCard = removeHandCard(state, actorId, slotId);
-        addHandCard(state, choice.targetPlayerId, handCard.cardId);
+        const added = addHandCard(state, choice.targetPlayerId, handCard.cardId);
+        addEvent(state, "power_donate", `${playerName(state, actorId)} donated a card to ${playerName(state, choice.targetPlayerId)}`, actorId, undefined, {
+          targets: [
+            { playerId: actorId, slotId },
+            { playerId: choice.targetPlayerId, slotId: added.slotId }
+          ],
+          targetPlayerId: choice.targetPlayerId,
+          source: "hand",
+          destination: "hand",
+          count: 1
+        });
       }
       maybeAutoJamio(state, actorId);
       break;
@@ -578,6 +686,12 @@ function resolvePower(state: GameState, actorId: PlayerId, choice: PowerChoice):
         const burned = removeHandCard(state, target.playerId, target.slotId);
         state.deck.push(burned.cardId);
       }
+      addEvent(state, "burn_cards", `${playerName(state, actorId)} burned ${choice.targets.length} card(s)`, actorId, undefined, {
+        targets: choice.targets,
+        source: "hand",
+        destination: "deck",
+        count: choice.targets.length
+      });
       break;
     }
     case "draw":
@@ -589,7 +703,7 @@ function resolvePower(state: GameState, actorId: PlayerId, choice: PowerChoice):
     }
   }
 
-  addEvent(state, "power_resolved", `${playerName(state, actorId)} resolved ${power.type}`, actorId);
+  addEvent(state, "power_resolved", `${playerName(state, actorId)} finished ${powerName(power)}`, actorId);
   state.pendingPower = null;
   advanceTurn(state, actorId);
 }
@@ -611,10 +725,15 @@ function finishViewedPower(state: GameState, actorId: PlayerId, shouldSwap: bool
     assertJamio(pending.power.type === "look_swap", "Only Look & Swap can swap revealed cards", "INVALID_POWER_CHOICE");
     assertJamio(revealedTargets.length === 2, "Look & Swap requires two revealed targets", "INVALID_POWER_CHOICE");
     swapTargets(state, revealedTargets[0]!, revealedTargets[1]!);
+    addEvent(state, "swap_cards", `${playerName(state, actorId)} swapped two cards`, actorId, undefined, {
+      targets: revealedTargets,
+      source: "power",
+      destination: "hand"
+    });
   }
 
   hideTargetsFromActor(state, actorId, revealedTargets);
-  addEvent(state, "power_resolved", `${playerName(state, actorId)} resolved ${pending.power.type}`, actorId);
+  addEvent(state, "power_resolved", `${playerName(state, actorId)} finished ${powerName(pending.power)}`, actorId);
   state.pendingPower = null;
   advanceTurn(state, actorId);
 }
@@ -626,7 +745,7 @@ function assertTargetCount(targets: CardTarget[], maxCount: number): void {
 
 function revealTargetsToActor(state: GameState, actorId: PlayerId, targets: CardTarget[]): void {
   for (const target of targets) {
-    const handCard = findHandCard(state, target.playerId, target.slotId).handCard;
+    const handCard = findOccupiedHandCard(state, target.playerId, target.slotId).handCard;
     if (!handCard.visibleTo.includes(actorId)) {
       handCard.visibleTo.push(actorId);
     }
@@ -644,8 +763,8 @@ function hideTargetsFromActor(state: GameState, actorId: PlayerId, targets: Card
 }
 
 function swapTargets(state: GameState, first: CardTarget, second: CardTarget): void {
-  const firstCard = findHandCard(state, first.playerId, first.slotId).handCard;
-  const secondCard = findHandCard(state, second.playerId, second.slotId).handCard;
+  const firstCard = findOccupiedHandCard(state, first.playerId, first.slotId).handCard;
+  const secondCard = findOccupiedHandCard(state, second.playerId, second.slotId).handCard;
   const firstCardId = firstCard.cardId;
   firstCard.cardId = secondCard.cardId;
   secondCard.cardId = firstCardId;
@@ -655,7 +774,14 @@ function swapTargets(state: GameState, first: CardTarget, second: CardTarget): v
 
 function drawMistakePenalty(state: GameState, playerId: PlayerId): void {
   if (state.ruleset.general.drawCardOnMistake) {
-    addHandCard(state, playerId, drawOne(state));
+    const added = addHandCard(state, playerId, drawOne(state));
+    addEvent(state, "penalty_draw", `${playerName(state, playerId)} drew a penalty card`, playerId, undefined, {
+      target: { playerId, slotId: added.slotId },
+      targetPlayerId: playerId,
+      source: "deck",
+      destination: "hand",
+      count: 1
+    });
   }
 }
 
@@ -677,29 +803,38 @@ function recycleDiscardPile(state: GameState): void {
   addEvent(state, "deck_recycled", "The played stack was shuffled into the deck");
 }
 
-function replaceHandCard(state: GameState, playerId: PlayerId, slotId: HandSlotId, newCardId: CardId): HandCard {
-  const target = findHandCard(state, playerId, slotId);
+function replaceHandCard(state: GameState, playerId: PlayerId, slotId: HandSlotId, newCardId: CardId): OccupiedHandCard {
+  const target = findOccupiedHandCard(state, playerId, slotId);
   const replaced = { ...target.handCard };
   target.handCard.cardId = newCardId;
   target.handCard.visibleTo = [];
   return replaced;
 }
 
-function removeHandCard(state: GameState, playerId: PlayerId, slotId: HandSlotId): HandCard {
-  const target = findHandCard(state, playerId, slotId);
-  const [removed] = target.hand.splice(target.index, 1);
-  assertJamio(removed, "Card could not be removed", "CARD_NOT_FOUND");
+function removeHandCard(state: GameState, playerId: PlayerId, slotId: HandSlotId): OccupiedHandCard {
+  const target = findOccupiedHandCard(state, playerId, slotId);
+  const removed = { ...target.handCard };
+  target.hand[target.index]!.cardId = null;
+  target.hand[target.index]!.visibleTo = [];
   return removed;
 }
 
-function addHandCard(state: GameState, playerId: PlayerId, cardId: CardId): void {
+function addHandCard(state: GameState, playerId: PlayerId, cardId: CardId): HandCard {
   const hand = state.hands[playerId];
   assertJamio(hand, "Player hand does not exist", "UNKNOWN_PLAYER");
-  hand.push({
-    slotId: makeSlotId(playerId, state.roundNumber, hand.length + 1000 + state.version + state.cardsPlayedThisRound),
+  const emptySlot = hand.find((candidate) => candidate.cardId === null);
+  if (emptySlot) {
+    emptySlot.cardId = cardId;
+    emptySlot.visibleTo = [];
+    return emptySlot;
+  }
+  const handCard = {
+    slotId: makeSlotId(playerId, state.roundNumber, nextSlotIndex(hand)),
     cardId,
     visibleTo: []
-  });
+  };
+  hand.push(handCard);
+  return handCard;
 }
 
 function findHandCard(
@@ -714,6 +849,20 @@ function findHandCard(
   const handCard = hand[index];
   assertJamio(handCard, "Card slot does not exist", "CARD_NOT_FOUND");
   return { hand, handCard, index };
+}
+
+function findOccupiedHandCard(
+  state: GameState,
+  playerId: PlayerId,
+  slotId: HandSlotId
+): { hand: HandCard[]; handCard: OccupiedHandCard; index: number } {
+  const target = findHandCard(state, playerId, slotId);
+  assertJamio(target.handCard.cardId, "Card slot is empty", "CARD_NOT_FOUND");
+  return {
+    hand: target.hand,
+    handCard: target.handCard as OccupiedHandCard,
+    index: target.index
+  };
 }
 
 function maybeFindHandCard(
@@ -731,6 +880,20 @@ function maybeFindHandCard(
   }
   const handCard = hand[index];
   return handCard ? { hand, handCard, index } : null;
+}
+
+function occupiedHandCards(state: GameState, playerId: PlayerId): OccupiedHandCard[] {
+  return (state.hands[playerId] ?? []).filter((handCard): handCard is OccupiedHandCard => Boolean(handCard.cardId));
+}
+
+function nextSlotIndex(hand: HandCard[]): number {
+  const highest = hand.reduce((max, handCard) => Math.max(max, slotIndexFromId(handCard.slotId)), -1);
+  return highest + 1;
+}
+
+function slotIndexFromId(slotId: HandSlotId): number {
+  const match = /-s(\d+)$/.exec(slotId);
+  return match ? Number(match[1]) : 0;
 }
 
 function advanceTurn(state: GameState, completedPlayerId: PlayerId): void {
@@ -768,7 +931,7 @@ function maybeAutoJamio(state: GameState, playerId: PlayerId): void {
   if (!state.ruleset.general.automaticJamioOnZeroCards || state.jamio) {
     return;
   }
-  if ((state.hands[playerId] ?? []).length === 0) {
+  if (occupiedHandCards(state, playerId).length === 0) {
     beginJamio(state, playerId);
   }
 }
@@ -845,12 +1008,38 @@ function playerName(state: GameState, playerId: PlayerId): string {
   return state.players.find((player) => player.id === playerId)?.name ?? playerId;
 }
 
+function powerName(power: CardPower): string {
+  switch (power.type) {
+    case "self_look":
+      return "Self Look";
+    case "look_swap":
+      return "Look & Swap";
+    case "universal_look":
+      return "Universal Look";
+    case "look":
+      return "Look";
+    case "swap":
+      return "Swap";
+    case "give":
+      return "Give";
+    case "donate":
+      return "Donate";
+    case "burn":
+      return "Burn";
+    case "draw":
+      return `Draw ${power.count}`;
+    case "emote":
+      return power.value;
+  }
+}
+
 function addEvent(
   state: GameState,
   type: string,
   message: string,
   actorId?: PlayerId,
-  publicCardId?: CardId
+  publicCardId?: CardId,
+  details: GameEventDetails = {}
 ): GameEvent {
   const event: GameEvent = {
     id: `e${state.version}-${state.eventLog.length}`,
@@ -862,6 +1051,24 @@ function addEvent(
   }
   if (publicCardId) {
     event.publicCardId = publicCardId;
+  }
+  if (details.target) {
+    event.target = details.target;
+  }
+  if (details.targets) {
+    event.targets = details.targets;
+  }
+  if (details.targetPlayerId) {
+    event.targetPlayerId = details.targetPlayerId;
+  }
+  if (details.source) {
+    event.source = details.source;
+  }
+  if (details.destination) {
+    event.destination = details.destination;
+  }
+  if (details.count !== undefined) {
+    event.count = details.count;
   }
   state.eventLog.push(event);
   return event;

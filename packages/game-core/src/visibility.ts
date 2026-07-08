@@ -13,12 +13,14 @@ export function getPlayerView(state: GameState, playerId: PlayerId): PlayerView 
     hostPlayerId: state.hostPlayerId,
     players: state.players.map((player) => ({
       ...player,
-      cardCount: state.hands[player.id]?.length ?? 0
+      cardCount: (state.hands[player.id] ?? []).filter((handCard) => handCard.cardId).length
     })),
     yourHand: ownHand.map((handCard, index) => ({
       slotId: handCard.slotId,
+      empty: !handCard.cardId,
       card:
-        shouldRevealAll || handCard.visibleTo.includes(playerId) || (state.phase === "initial_memorize" && index < 2)
+        handCard.cardId &&
+        (shouldRevealAll || handCard.visibleTo.includes(playerId) || (state.phase === "initial_memorize" && index < 2))
           ? publicCardFor(state, handCard.cardId)
           : null
     })),
@@ -28,7 +30,11 @@ export function getPlayerView(state: GameState, playerId: PlayerId): PlayerView 
         playerId: player.id,
         cards: (state.hands[player.id] ?? []).map((handCard) => ({
           slotId: handCard.slotId,
-          card: shouldRevealAll || handCard.visibleTo.includes(playerId) ? publicCardFor(state, handCard.cardId) : null
+          empty: !handCard.cardId,
+          card:
+            handCard.cardId && (shouldRevealAll || handCard.visibleTo.includes(playerId))
+              ? publicCardFor(state, handCard.cardId)
+              : null
         }))
       })),
     deckCount: state.deck.length,

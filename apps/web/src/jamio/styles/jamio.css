@@ -591,8 +591,6 @@ h2 {
 .mini-cards-grid,
 .cards-grid {
   display: grid;
-  grid-auto-flow: column;
-  grid-template-rows: repeat(2, auto);
   justify-content: center;
   justify-items: center;
   align-items: center;
@@ -713,9 +711,29 @@ h2 {
   transform: translateZ(0);
 }
 
+.card-button.is-empty-slot {
+  cursor: default;
+}
+
+.empty-card-slot {
+  width: clamp(72px, 20vw, 112px);
+  aspect-ratio: 2.5 / 3.5;
+  border: 2px dashed rgba(248, 255, 251, 0.22);
+  border-radius: 8px;
+  display: block;
+  background: rgba(9, 33, 24, 0.12);
+  box-shadow: inset 0 0 0 1px rgba(9, 33, 24, 0.12);
+}
+
+.mini-cards-grid .empty-card-slot {
+  width: clamp(54px, 10vw, 72px);
+}
+
 .card-button.is-revealing .playing-card,
 .card-button.is-replacing .playing-card,
 .card-button.is-donating .playing-card,
+.card-button.is-drawing-card .playing-card,
+.card-button.is-looked-at .playing-card,
 .card-button.is-discarding .playing-card,
 .card-button.is-burning .playing-card,
 .card-button.is-moving .playing-card {
@@ -726,12 +744,95 @@ h2 {
   animation: cardTravel 560ms cubic-bezier(.2,.9,.2,1);
 }
 
+.card-button.is-looked-at .playing-card {
+  outline: 3px solid #75d8ff;
+  outline-offset: 5px;
+  box-shadow:
+    0 0 0 6px rgba(117, 216, 255, 0.14),
+    0 0 30px rgba(117, 216, 255, 0.52),
+    0 18px 28px rgba(9, 33, 24, 0.22);
+}
+
+.card-button.is-swapping .playing-card {
+  outline: 3px solid #ffd166;
+  outline-offset: 5px;
+  box-shadow:
+    0 0 0 6px rgba(255, 209, 102, 0.16),
+    0 0 30px rgba(255, 209, 102, 0.56),
+    0 18px 28px rgba(9, 33, 24, 0.22);
+}
+
+.card-button.is-replacing .playing-card {
+  outline: 3px solid #9dd8ff;
+  outline-offset: 5px;
+  box-shadow:
+    0 0 0 6px rgba(157, 216, 255, 0.14),
+    0 0 30px rgba(157, 216, 255, 0.48),
+    0 18px 28px rgba(9, 33, 24, 0.22);
+}
+
+.card-button.is-donating .playing-card,
+.card-button.is-drawing-card .playing-card {
+  outline: 3px solid #a7f3a7;
+  outline-offset: 5px;
+  box-shadow:
+    0 0 0 6px rgba(167, 243, 167, 0.14),
+    0 0 30px rgba(167, 243, 167, 0.46),
+    0 18px 28px rgba(9, 33, 24, 0.22);
+}
+
+.card-button.is-discarding .playing-card,
+.card-button.is-burning .playing-card {
+  outline: 3px solid #ff8a8a;
+  outline-offset: 5px;
+  box-shadow:
+    0 0 0 6px rgba(255, 138, 138, 0.14),
+    0 0 30px rgba(255, 138, 138, 0.5),
+    0 18px 28px rgba(9, 33, 24, 0.22);
+}
+
 .stack.is-drawing .playing-card {
   animation: drawLift 520ms cubic-bezier(.2,.9,.2,1);
 }
 
 .stack.is-receiving .playing-card {
   animation: receiveCard 520ms cubic-bezier(.2,.9,.2,1);
+}
+
+.card-flight-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  pointer-events: none;
+}
+
+.card-flight {
+  position: fixed;
+  animation: cardFlight 760ms cubic-bezier(.2,.9,.2,1) both;
+  filter: drop-shadow(0 18px 22px rgba(9, 33, 24, 0.34));
+  transform-origin: center;
+}
+
+.card-flight .playing-card {
+  width: 100%;
+  height: 100%;
+}
+
+.card-flight.is-swap-flight .playing-card {
+  outline: 3px solid #ffd166;
+  outline-offset: 4px;
+}
+
+.card-flight.is-donate-flight .playing-card,
+.card-flight.is-draw-flight .playing-card {
+  outline: 3px solid #a7f3a7;
+  outline-offset: 4px;
+}
+
+.card-flight.is-discard-flight .playing-card,
+.card-flight.is-burn-flight .playing-card {
+  outline: 3px solid #ff8a8a;
+  outline-offset: 4px;
 }
 
 .table-actions {
@@ -889,6 +990,21 @@ h2 {
   }
   100% {
     transform: scale(1);
+  }
+}
+
+@keyframes cardFlight {
+  0% {
+    opacity: 0.98;
+    transform: translate(0, 0) scale(1) rotate(-1deg);
+  }
+  72% {
+    opacity: 0.98;
+    transform: translate(var(--move-x), var(--move-y)) scale(1.03) rotate(2deg);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(var(--move-x), var(--move-y)) scale(0.96) rotate(2deg);
   }
 }
 

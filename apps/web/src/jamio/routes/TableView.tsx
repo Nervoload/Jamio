@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type RefCallback } from "react";
-import type { CardPower, CardTarget, GameAction, Player, PlayerId, PlayerView, PublicCard } from "@jamio/game-core";
+import type { CardPower, CardTarget, GameAction, GameEvent, Player, PlayerId, PlayerView, PublicCard } from "@jamio/game-core";
 import { Card } from "../components/Card";
 import { RoomCodeBadge } from "../components/RoomCodeBadge";
 import { Scoreboard } from "../components/Scoreboard";
@@ -28,7 +28,13 @@ const lookRevealTimeoutMs = 30_000;
 
 type TargetMotion = {
   className: string;
-  style?: CSSProperties & Record<"--move-x" | "--move-y", string>;
+  style?: CSSProperties & Partial<Record<"--move-x" | "--move-y", string>>;
+};
+
+type FlightMotion = {
+  id: string;
+  className: string;
+  style: CSSProperties & Record<"--move-x" | "--move-y", string>;
 };
 
 type TableViewProps = {
@@ -60,11 +66,17 @@ export function TableView({
   const [lastTap, setLastTap] = useState<{ key: string; at: number } | null>(null);
   const [targetMotions, setTargetMotions] = useState<Record<string, TargetMotion>>({});
   const [stackMotion, setStackMotion] = useState<"deck" | "discard" | null>(null);
+  const [flightMotions, setFlightMotions] = useState<FlightMotion[]>([]);
   const targetRefs = useRef(new Map<string, HTMLButtonElement>());
   const cardMotionRefs = useRef(new Map<string, HTMLButtonElement>());
+  const stackRefs = useRef(new Map<"deck" | "discard", HTMLButtonElement>());
+  const playerAreaRefs = useRef(new Map<PlayerId, HTMLElement>());
   const previousCardRects = useRef(new Map<string, DOMRect>());
+  const animatedEventIds = useRef(new Set<string>());
+  const hasHydratedEventLog = useRef(false);
   const targetMotionTimeout = useRef<number | null>(null);
   const stackMotionTimeout = useRef<number | null>(null);
+  const flightCounter = useRef(0);
 
   const currentPlayer = session.players.find((player) => player.id === currentPlayerId) ?? session.players[0]!;
   const isOnline = session.kind === "online";
@@ -132,6 +144,29 @@ export function TableView({
     previousCardRects.current = nextRects;
   }, [view?.version, currentPlayerId]);
 
+  useEffect(() => {
+    if (!view) {
+      return;
+    }
+
+    if (!hasHydratedEventLog.current) {
+      for (const event of view.eventLog) {
+        animatedEventIds.current.add(event.id);
+      }
+      hasHydratedEventLog.current = true;
+      return;
+    }
+
+    const unseenEvents = view.eventLog.filter((event) => !animatedEventIds.current.has(event.id));
+    for (const event of unseenEvents) {
+      animatedEventIds.current.add(event.id);
+      animateSharedEvent(event);
+    }
+
+    const visibleIds = new Set(view.eventLog.map((event) => event.id));
+    animatedEventIds.current = new Set([...animatedEventIds.current].filter((eventId) => visibleIds.has(eventId)));
+  }, [view?.eventLog, view?.version]);
+
   const legal = useMemo(() => {
     return new Set(view?.legalActions.map((action) => action.type) ?? []);
   }, [view]);
@@ -179,6 +214,26 @@ export function TableView({
     };
   }
 
+  function registerStackElement(stack: "deck" | "discard"): RefCallback<HTMLButtonElement> {
+    return (node) => {
+      if (node) {
+        stackRefs.current.set(stack, node);
+      } else {
+        stackRefs.current.delete(stack);
+      }
+    };
+  }
+
+  function registerPlayerAreaElement(playerId: PlayerId): RefCallback<HTMLElement> {
+    return (node) => {
+      if (node) {
+        playerAreaRefs.current.set(playerId, node);
+      } else {
+        playerAreaRefs.current.delete(playerId);
+      }
+    };
+  }
+
   function setTemporaryTargetMotions(nextMotions: Record<string, TargetMotion>, duration = 560) {
     if (targetMotionTimeout.current) {
       window.clearTimeout(targetMotionTimeout.current);
@@ -201,9 +256,9 @@ export function TableView({
     }, duration);
   }
 
-  function markTargets(targets: CardTarget[], className: string) {
+  function markTargets(targets: CardTarget[], className: string, duration = 560) {
     const motions = Object.fromEntries(targets.map((target) => [targetKey(target), { className }]));
-    setTemporaryTargetMotions(motions);
+    setTemporaryTargetMotions(motions, duration);
   }
 
   function markSwapTargets(targets: [CardTarget, CardTarget]) {
@@ -233,6 +288,121 @@ export function TableView({
         }
       }
     });
+    animateFlight(targetRefs.current.get(firstKey), targetRefs.current.get(secondKey), "is-swap-flight");
+    animateFlight(targetRefs.current.get(secondKey), targetRefs.current.get(firstKey), "is-swap-flight");
+  }
+
+  function animateFlight(fromNode: Element | null | undefined, toNode: Element | null | undefined, className: string) {
+    if (!fromNode || !toNode || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      return;
+    }
+    const fromRect = fromNode.getBoundingClientRect();
+    const toRect = toNode.getBoundingClientRect();
+    const id = `flight-${flightCounter.current++}`;
+    const flight: FlightMotion = {
+      id,
+      className,
+      style: {
+        left: `${fromRect.left}px`,
+        top: `${fromRect.top}px`,
+        width: `${fromRect.width}px`,
+        height: `${fromRect.height}px`,
+        "--move-x": `${toRect.left + toRect.width / 2 - (fromRect.left + fromRect.width / 2)}px`,
+        "--move-y": `${toRect.top + toRect.height / 2 - (fromRect.top + fromRect.height / 2)}px`
+      }
+    };
+    setFlightMotions((current) => [...current, flight]);
+    window.setTimeout(() => {
+      setFlightMotions((current) => current.filter((candidate) => candidate.id !== id));
+    }, 780);
+  }
+
+  function targetNode(target: CardTarget): HTMLButtonElement | undefined {
+    return targetRefs.current.get(targetKey(target));
+  }
+
+  function stackNode(stack: "deck" | "discard"): HTMLButtonElement | undefined {
+    return stackRefs.current.get(stack);
+  }
+
+  function playerAreaNode(playerId: PlayerId): HTMLElement | undefined {
+    return playerAreaRefs.current.get(playerId);
+  }
+
+  function animateStackToTargets(stack: "deck" | "discard", targets: CardTarget[], className: string) {
+    for (const target of targets) {
+      animateFlight(stackNode(stack), targetNode(target), className);
+    }
+  }
+
+  function animateTargetsToStack(targets: CardTarget[], stack: "deck" | "discard", className: string) {
+    for (const target of targets) {
+      animateFlight(targetNode(target), stackNode(stack), className);
+    }
+  }
+
+  function animateSharedEvent(event: GameEvent) {
+    const targets = eventTargets(event);
+
+    switch (event.type) {
+      case "draw":
+        setTemporaryStackMotion("deck");
+        animateFlight(stackNode("deck"), event.targetPlayerId ? playerAreaNode(event.targetPlayerId) : undefined, "is-draw-flight");
+        return;
+      case "play_card":
+        setTemporaryStackMotion("discard");
+        if (event.source === "drawn") {
+          animateFlight(event.targetPlayerId ? playerAreaNode(event.targetPlayerId) : undefined, stackNode("discard"), "is-discard-flight");
+        }
+        return;
+      case "replace_card":
+        if (event.source === "deck" || event.source === "drawn") {
+          setTemporaryStackMotion("deck");
+          animateStackToTargets("deck", targets, "is-draw-flight");
+        }
+        if (event.source === "discard") {
+          setTemporaryStackMotion("discard");
+          animateStackToTargets("discard", targets, "is-draw-flight");
+        }
+        animateTargetsToStack(targets, "discard", "is-discard-flight");
+        markTargets(targets, "is-replacing");
+        return;
+      case "swap_cards":
+        if (targets.length >= 2) {
+          markSwapTargets(targets.slice(0, 2) as [CardTarget, CardTarget]);
+        }
+        return;
+      case "power_reveal":
+        markTargets(targets, "is-looked-at", 5000);
+        return;
+      case "power_draw":
+      case "power_give":
+      case "penalty_draw":
+        setTemporaryStackMotion("deck");
+        animateStackToTargets("deck", targets, "is-draw-flight");
+        markTargets(targets, "is-drawing-card");
+        return;
+      case "discard_reward":
+      case "power_donate":
+        if (targets.length >= 2) {
+          animateFlight(targetNode(targets[0]!), targetNode(targets[1]!), "is-donate-flight");
+        }
+        markTargets(targets, "is-donating");
+        return;
+      case "discard_correct":
+      case "discard_mistake":
+      case "opponent_discard_correct":
+      case "opponent_discard_mistake":
+        animateTargetsToStack(targets, "discard", "is-discard-flight");
+        markTargets(targets, "is-discarding");
+        return;
+      case "burn_cards":
+        animateTargetsToStack(targets, "deck", "is-burn-flight");
+        markTargets(targets, "is-burning");
+        return;
+      default:
+        return;
+    }
   }
 
   function dispatch(action: GameAction) {
@@ -418,19 +588,19 @@ export function TableView({
         {isPinkTheme(session.table.theme) ? <HeartSprinkles seed={session.table.roomCode} /> : null}
         <div className="status-banner">
           <strong>{phaseCopy(view.phase)}</strong>
-          <span>{statusCopy(view, currentPlayer.name)}</span>
+          <span>{latestTableAnnouncement(view) ?? statusCopy(view, currentPlayer.name)}</span>
         </div>
 
         <div className="opponent-strip">
           {view.opponentHands.map((hand) => {
             const player = view.players.find((candidate) => candidate.id === hand.playerId);
             return (
-              <div className="opponent-seat" key={hand.playerId}>
+              <div className="opponent-seat" key={hand.playerId} ref={registerPlayerAreaElement(hand.playerId) as RefCallback<HTMLDivElement>}>
                 <div className="seat-pill">
                   <span>{player?.name ?? hand.playerId}</span>
-                  <strong>{hand.cards.length} cards</strong>
+                  <strong>{player?.cardCount ?? 0} cards</strong>
                 </div>
-                <div className="mini-cards-grid" style={gridColumnsStyle(hand.cards.length)}>
+                <div className="mini-cards-grid" style={slotGridStyle(hand.cards)}>
                   {hand.cards.map((handCard) => {
                     const target = { playerId: hand.playerId, slotId: handCard.slotId };
                     const motion = targetMotions[targetKey(target)];
@@ -438,13 +608,14 @@ export function TableView({
                       <CardButton
                         key={handCard.slotId}
                         card={handCard.card}
+                        empty={handCard.empty}
                         target={target}
                         selectable={isSelectable(mode, power, currentPlayerId, target)}
                         selected={isSelected(selectedTargets, target)}
                         motionClassName={motion?.className}
-                        motionStyle={motion?.style}
+                        motionStyle={cardButtonStyle(handCard.slotId, motion?.style)}
                         targetRef={registerTargetElement(target)}
-                        cardMotionRef={registerCardMotionElement(handCard.card)}
+                        cardMotionRef={registerCardMotionElement(handCard.empty ? null : handCard.card)}
                         onClick={handleCardClick}
                         onTap={handleCardTap}
                       />
@@ -459,6 +630,7 @@ export function TableView({
         <div className="center-stacks" aria-label="table center">
           <button
             className={`stack deck-stack ${canDraw ? "is-actionable" : ""} ${stackMotion === "deck" ? "is-drawing" : ""}`}
+            ref={registerStackElement("deck")}
             type="button"
             disabled={!canDraw}
             onClick={() => {
@@ -472,6 +644,7 @@ export function TableView({
           </button>
           <button
             className={`stack played-stack ${canTakeDiscard ? "is-actionable" : ""} ${stackMotion === "discard" ? "is-receiving" : ""}`}
+            ref={registerStackElement("discard")}
             type="button"
             disabled={!canTakeDiscard}
             onClick={() => setMode("take_discard")}
@@ -507,12 +680,12 @@ export function TableView({
           }}
         />
 
-        <div className="player-hand">
+        <div className="player-hand" ref={registerPlayerAreaElement(currentPlayerId) as RefCallback<HTMLDivElement>}>
           <div className="hand-heading">
             <span>{currentPlayer.name}</span>
             <small>{modeCopy(mode, view.lastPlayedSeq)}</small>
           </div>
-          <div className="cards-grid" style={gridColumnsStyle(view.yourHand.length)}>
+          <div className="cards-grid" style={slotGridStyle(view.yourHand)}>
             {view.yourHand.map((handCard) => {
               const target = { playerId: currentPlayerId, slotId: handCard.slotId };
               const motion = targetMotions[targetKey(target)];
@@ -520,13 +693,14 @@ export function TableView({
                 <CardButton
                   key={handCard.slotId}
                   card={handCard.card}
+                  empty={handCard.empty}
                   target={target}
                   selectable={isSelectable(mode, power, currentPlayerId, target)}
                   selected={isSelected(selectedTargets, target)}
                   motionClassName={motion?.className}
-                  motionStyle={motion?.style}
+                  motionStyle={cardButtonStyle(handCard.slotId, motion?.style)}
                   targetRef={registerTargetElement(target)}
-                  cardMotionRef={registerCardMotionElement(handCard.card)}
+                  cardMotionRef={registerCardMotionElement(handCard.empty ? null : handCard.card)}
                   onClick={handleCardClick}
                   onTap={handleCardTap}
                 />
@@ -545,6 +719,14 @@ export function TableView({
       <button className="leave-button" type="button" onClick={onLeave}>
         Leave Table
       </button>
+
+      <div className="card-flight-layer" aria-hidden="true">
+        {flightMotions.map((flight) => (
+          <div className={`card-flight ${flight.className}`} key={flight.id} style={flight.style}>
+            <Card card={null} />
+          </div>
+        ))}
+      </div>
     </main>
   );
 }
@@ -885,11 +1067,12 @@ function RevealPanel({ view, hostPlayerId, currentPlayerId, onAction, onRestartF
 
 type CardButtonProps = {
   card: PublicCard | null;
+  empty: boolean;
   target: CardTarget;
   selectable: boolean;
   selected: boolean;
   motionClassName?: string | undefined;
-  motionStyle?: TargetMotion["style"] | undefined;
+  motionStyle?: (CSSProperties & Partial<Record<"--move-x" | "--move-y", string>>) | undefined;
   targetRef: RefCallback<HTMLButtonElement>;
   cardMotionRef: RefCallback<HTMLButtonElement>;
   onClick: (target: CardTarget) => void;
@@ -898,6 +1081,7 @@ type CardButtonProps = {
 
 function CardButton({
   card,
+  empty,
   target,
   selectable,
   selected,
@@ -912,12 +1096,15 @@ function CardButton({
     <button
       ref={(node) => {
         targetRef(node);
-        cardMotionRef(node);
+        cardMotionRef(empty ? null : node);
       }}
-      className={`card-button ${selectable ? "is-selectable" : ""} ${selected ? "is-selected" : ""} ${motionClassName ?? ""}`}
+      className={`card-button ${empty ? "is-empty-slot" : ""} ${selectable && !empty ? "is-selectable" : ""} ${selected ? "is-selected" : ""} ${motionClassName ?? ""}`}
       style={motionStyle}
       type="button"
       onClick={() => {
+        if (empty) {
+          return;
+        }
         if (selectable) {
           onClick(target);
           return;
@@ -925,7 +1112,7 @@ function CardButton({
         onTap(target);
       }}
     >
-      <Card card={card} />
+      {empty ? <span className="empty-card-slot" /> : <Card card={card} />}
     </button>
   );
 }
@@ -999,19 +1186,61 @@ function getAllCardTargets(view: PlayerView | null, currentPlayerId: PlayerId): 
     return [];
   }
   return [
-    ...view.yourHand.map((card) => ({ playerId: currentPlayerId, slotId: card.slotId })),
-    ...view.opponentHands.flatMap((hand) => hand.cards.map((card) => ({ playerId: hand.playerId, slotId: card.slotId })))
+    ...view.yourHand.filter((card) => !card.empty).map((card) => ({ playerId: currentPlayerId, slotId: card.slotId })),
+    ...view.opponentHands.flatMap((hand) =>
+      hand.cards.filter((card) => !card.empty).map((card) => ({ playerId: hand.playerId, slotId: card.slotId }))
+    )
   ];
 }
 
-function gridColumnsStyle(cardCount: number): CSSProperties {
+function slotGridStyle(cards: Array<{ slotId: string }>): CSSProperties {
+  const columns = Math.max(1, ...cards.map((card) => slotGridPosition(slotIndexFromId(card.slotId)).column));
   return {
-    gridTemplateColumns: `repeat(${Math.max(1, Math.ceil(cardCount / 2))}, minmax(0, max-content))`
+    gridTemplateColumns: `repeat(${columns}, minmax(0, max-content))`,
+    gridTemplateRows: "repeat(2, auto)"
   };
+}
+
+function cardButtonStyle(
+  slotId: string,
+  motionStyle?: CSSProperties & Partial<Record<"--move-x" | "--move-y", string>>
+): CSSProperties & Partial<Record<"--move-x" | "--move-y", string>> {
+  const position = slotGridPosition(slotIndexFromId(slotId));
+  return {
+    gridColumn: position.column,
+    gridRow: position.row,
+    ...motionStyle
+  };
+}
+
+function slotGridPosition(slotIndex: number): { row: number; column: number } {
+  if (slotIndex < 4) {
+    return {
+      row: slotIndex < 2 ? 1 : 2,
+      column: (slotIndex % 2) + 1
+    };
+  }
+  const extraIndex = slotIndex - 4;
+  return {
+    row: (extraIndex % 2) + 1,
+    column: 3 + Math.floor(extraIndex / 2)
+  };
+}
+
+function slotIndexFromId(slotId: string): number {
+  const match = /-s(\d+)$/.exec(slotId);
+  return match ? Number(match[1]) : 0;
 }
 
 function targetKey(target: CardTarget): string {
   return `${target.playerId}:${target.slotId}`;
+}
+
+function eventTargets(event: GameEvent): CardTarget[] {
+  if (event.targets?.length) {
+    return event.targets;
+  }
+  return event.target ? [event.target] : [];
 }
 
 function toggleTarget(current: CardTarget[], target: CardTarget): CardTarget[] {
@@ -1109,6 +1338,24 @@ function statusCopy(view: PlayerView, currentPlayerName: string): string {
     return "Final scores are locked.";
   }
   return "Table is waiting.";
+}
+
+function latestTableAnnouncement(view: PlayerView): string | null {
+  const announcementTypes = new Set([
+    "draw",
+    "play_card",
+    "replace_card",
+    "power_pending",
+    "power_reveal",
+    "swap_cards",
+    "power_draw",
+    "power_give",
+    "power_donate",
+    "discard_reward",
+    "penalty_draw",
+    "burn_cards"
+  ]);
+  return [...view.eventLog].reverse().find((event) => announcementTypes.has(event.type))?.message ?? null;
 }
 
 function modeCopy(mode: SelectionMode, lastPlayedSeq: number | null): string {

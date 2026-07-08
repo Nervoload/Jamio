@@ -96,7 +96,7 @@ export type PlayerState = Player & {
 
 export type HandCard = {
   slotId: HandSlotId;
-  cardId: CardId;
+  cardId: CardId | null;
   visibleTo: PlayerId[];
 };
 
@@ -146,6 +146,12 @@ export type GameEvent = {
   message: string;
   actorId?: PlayerId;
   publicCardId?: CardId;
+  target?: CardTarget;
+  targets?: CardTarget[];
+  targetPlayerId?: PlayerId;
+  source?: "deck" | "discard" | "drawn" | "hand" | "power";
+  destination?: "discard" | "hand" | "deck";
+  count?: number;
 };
 
 export type GameState = {
@@ -233,12 +239,13 @@ export type PublicCard = {
 
 export type ClientHandCard = {
   slotId: HandSlotId;
+  empty: boolean;
   card: PublicCard | null;
 };
 
 export type PublicOpponentHand = {
   playerId: PlayerId;
-  cards: Array<{ slotId: HandSlotId; card: PublicCard | null }>;
+  cards: Array<{ slotId: HandSlotId; empty: boolean; card: PublicCard | null }>;
 };
 
 export type PublicPlayerView = PlayerState & {
