@@ -94,6 +94,8 @@ export function TableView({
   const revealedAtVersion = powerPrompt?.revealedAtVersion;
   const isViewingPower = revealedTargets.length > 0;
   const allCardTargets = useMemo(() => getAllCardTargets(view, currentPlayerId), [view, currentPlayerId]);
+  const eventLogSignature = view?.eventLog.map((event) => event.id).join("|") ?? "";
+  const publicEventMotions = useMemo(() => latestPublicEventMotions(view), [eventLogSignature, view]);
 
   useEffect(() => {
     setSelectedTargets([]);
@@ -170,7 +172,7 @@ export function TableView({
 
     const visibleIds = new Set(view.eventLog.map((event) => event.id));
     animatedEventIds.current = new Set([...animatedEventIds.current].filter((eventId) => visibleIds.has(eventId)));
-  }, [view?.eventLog, view?.version, view?.roomId, currentPlayerId]);
+  }, [eventLogSignature, view?.version, view?.roomId, currentPlayerId]);
 
   const legal = useMemo(() => {
     return new Set(view?.legalActions.map((action) => action.type) ?? []);
@@ -266,13 +268,18 @@ export function TableView({
     setTemporaryTargetMotions(motions, duration);
   }
 
-  function queueSharedEventAnimation(event: GameEvent) {
+  function queueSharedEventAnimation(event: GameEvent, attempt = 0) {
     window.requestAnimationFrame(() => {
-      window.requestAnimationFrame(() => animateSharedEvent(event));
+      window.requestAnimationFrame(() => {
+        const didAnimate = animateSharedEvent(event);
+        if (!didAnimate && attempt < 5) {
+          window.setTimeout(() => queueSharedEventAnimation(event, attempt + 1), 90);
+        }
+      });
     });
   }
 
-  function markSwapTargets(targets: [CardTarget, CardTarget]) {
+  function markSwapTargets(targets: [CardTarget, CardTarget]): boolean {
     const firstKey = targetKey(targets[0]);
     const secondKey = targetKey(targets[1]);
     const firstRect = targetRefs.current.get(firstKey)?.getBoundingClientRect();
@@ -280,7 +287,7 @@ export function TableView({
 
     if (!firstRect || !secondRect) {
       markTargets(targets, "is-moving");
-      return;
+      return false;
     }
 
     setTemporaryTargetMotions({
@@ -299,13 +306,14 @@ export function TableView({
         }
       }
     });
-    animateFlight(targetRefs.current.get(firstKey), targetRefs.current.get(secondKey), "is-swap-flight");
-    animateFlight(targetRefs.current.get(secondKey), targetRefs.current.get(firstKey), "is-swap-flight");
+    const firstFlight = animateFlight(targetRefs.current.get(firstKey), targetRefs.current.get(secondKey), "is-swap-flight");
+    const secondFlight = animateFlight(targetRefs.current.get(secondKey), targetRefs.current.get(firstKey), "is-swap-flight");
+    return firstFlight && secondFlight;
   }
 
-  function animateFlight(fromNode: Element | null | undefined, toNode: Element | null | undefined, className: string) {
+  function animateFlight(fromNode: Element | null | undefined, toNode: Element | null | undefined, className: string): boolean {
     if (!fromNode || !toNode) {
-      return;
+      return false;
     }
     const fromRect = motionRectForNode(fromNode);
     const toRect = motionRectForNode(toNode);
@@ -326,6 +334,7 @@ export function TableView({
     window.setTimeout(() => {
       setFlightMotions((current) => current.filter((candidate) => candidate.id !== id));
     }, 780);
+    return true;
   }
 
   function motionRectForNode(node: Element): MotionRect {
@@ -373,79 +382,84 @@ export function TableView({
     return playerAreaRefs.current.get(playerId);
   }
 
-  function animateStackToTargets(stack: "deck" | "discard", targets: CardTarget[], className: string) {
+  function animateStackToTargets(stack: "deck" | "discard", targets: CardTarget[], className: string): boolean {
+    let didAnimate = false;
     for (const target of targets) {
-      animateFlight(stackNode(stack), targetNode(target), className);
+      didAnimate = animateFlight(stackNode(stack), targetNode(target), className) || didAnimate;
     }
+    return didAnimate;
   }
 
-  function animateTargetsToStack(targets: CardTarget[], stack: "deck" | "discard", className: string) {
+  function animateTargetsToStack(targets: CardTarget[], stack: "deck" | "discard", className: string): boolean {
+    let didAnimate = false;
     for (const target of targets) {
-      animateFlight(targetNode(target), stackNode(stack), className);
+      didAnimate = animateFlight(targetNode(target), stackNode(stack), className) || didAnimate;
     }
+    return didAnimate;
   }
 
-  function animateSharedEvent(event: GameEvent) {
+  function animateSharedEvent(event: GameEvent): boolean {
     const targets = eventTargets(event);
 
     switch (event.type) {
       case "draw":
         setTemporaryStackMotion("deck");
-        animateFlight(stackNode("deck"), event.targetPlayerId ? playerAreaNode(event.targetPlayerId) : undefined, "is-draw-flight");
-        return;
+        return animateFlight(stackNode("deck"), event.targetPlayerId ? playerAreaNode(event.targetPlayerId) : undefined, "is-draw-flight");
       case "play_card":
         setTemporaryStackMotion("discard");
         if (event.source === "drawn") {
-          animateFlight(event.targetPlayerId ? playerAreaNode(event.targetPlayerId) : undefined, stackNode("discard"), "is-discard-flight");
+          return animateFlight(stackNode("deck"), stackNode("discard"), "is-discard-flight");
         }
-        return;
+        return true;
       case "replace_card":
+        let replaceAnimated = false;
         if (event.source === "deck" || event.source === "drawn") {
           setTemporaryStackMotion("deck");
-          animateStackToTargets("deck", targets, "is-draw-flight");
+          replaceAnimated = animateStackToTargets("deck", targets, "is-draw-flight") || replaceAnimated;
         }
         if (event.source === "discard") {
           setTemporaryStackMotion("discard");
-          animateStackToTargets("discard", targets, "is-draw-flight");
+          replaceAnimated = animateStackToTargets("discard", targets, "is-draw-flight") || replaceAnimated;
         }
-        animateTargetsToStack(targets, "discard", "is-discard-flight");
+        replaceAnimated = animateTargetsToStack(targets, "discard", "is-discard-flight") || replaceAnimated;
         markTargets(targets, "is-replacing");
-        return;
+        return replaceAnimated || targets.length === 0;
       case "swap_cards":
         if (targets.length >= 2) {
-          markSwapTargets(targets.slice(0, 2) as [CardTarget, CardTarget]);
+          return markSwapTargets(targets.slice(0, 2) as [CardTarget, CardTarget]);
         }
-        return;
+        return false;
       case "power_reveal":
         markTargets(targets, "is-looked-at", 5000);
-        return;
+        return true;
       case "power_draw":
       case "power_give":
       case "penalty_draw":
         setTemporaryStackMotion("deck");
-        animateStackToTargets("deck", targets, "is-draw-flight");
+        const drawAnimated = animateStackToTargets("deck", targets, "is-draw-flight");
         markTargets(targets, "is-drawing-card");
-        return;
+        return drawAnimated || targets.length === 0;
       case "discard_reward":
       case "power_donate":
+        let donateAnimated = false;
         if (targets.length >= 2) {
-          animateFlight(targetNode(targets[0]!), targetNode(targets[1]!), "is-donate-flight");
+          donateAnimated = animateFlight(targetNode(targets[0]!), targetNode(targets[1]!), "is-donate-flight");
         }
         markTargets(targets, "is-donating");
-        return;
+        return donateAnimated || targets.length < 2;
       case "discard_correct":
       case "discard_mistake":
       case "opponent_discard_correct":
       case "opponent_discard_mistake":
-        animateTargetsToStack(targets, "discard", "is-discard-flight");
+        const discardAnimated = animateTargetsToStack(targets, "discard", "is-discard-flight");
         markTargets(targets, "is-discarding");
-        return;
+        return discardAnimated || targets.length === 0;
       case "burn_cards":
-        animateTargetsToStack(targets, "deck", "is-burn-flight");
+        const burnAnimated = animateTargetsToStack(targets, "deck", "is-burn-flight");
         markTargets(targets, "is-burning");
-        return;
+        return burnAnimated || targets.length === 0;
       default:
-        return;
+        return true;
     }
   }
 
@@ -647,7 +661,7 @@ export function TableView({
                 <div className="mini-cards-grid" style={slotGridStyle(hand.cards)}>
                   {hand.cards.map((handCard) => {
                     const target = { playerId: hand.playerId, slotId: handCard.slotId };
-                    const motion = targetMotions[targetKey(target)];
+                    const motion = targetMotions[targetKey(target)] ?? publicEventMotions[targetKey(target)];
                     return (
                       <CardButton
                         key={handCard.slotId}
@@ -732,7 +746,7 @@ export function TableView({
           <div className="cards-grid" style={slotGridStyle(view.yourHand)}>
             {view.yourHand.map((handCard) => {
               const target = { playerId: currentPlayerId, slotId: handCard.slotId };
-              const motion = targetMotions[targetKey(target)];
+              const motion = targetMotions[targetKey(target)] ?? publicEventMotions[targetKey(target)];
               return (
                 <CardButton
                   key={handCard.slotId}
@@ -1285,6 +1299,20 @@ function eventTargets(event: GameEvent): CardTarget[] {
     return event.targets;
   }
   return event.target ? [event.target] : [];
+}
+
+function latestPublicEventMotions(view: PlayerView | null): Record<string, TargetMotion> {
+  if (!view) {
+    return {};
+  }
+  const event = [...view.eventLog]
+    .reverse()
+    .find((candidate) => candidate.type === "power_reveal" || candidate.type === "swap_cards");
+  if (!event) {
+    return {};
+  }
+  const className = event.type === "swap_cards" ? "is-swapping" : "is-looked-at";
+  return Object.fromEntries(eventTargets(event).map((target) => [targetKey(target), { className }]));
 }
 
 function toggleTarget(current: CardTarget[], target: CardTarget): CardTarget[] {

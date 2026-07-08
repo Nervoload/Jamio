@@ -701,6 +701,8 @@ h2 {
 }
 
 .card-button {
+  --move-x: 0px;
+  --move-y: 0px;
   border: 0;
   border-radius: 8px;
   padding: 0;
