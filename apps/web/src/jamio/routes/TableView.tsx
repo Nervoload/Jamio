@@ -37,6 +37,13 @@ type FlightMotion = {
   style: CSSProperties & Record<"--move-x" | "--move-y", string>;
 };
 
+type MotionRect = {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+};
+
 type TableViewProps = {
   session: TableSession;
   view: PlayerView | null;
@@ -73,7 +80,7 @@ export function TableView({
   const playerAreaRefs = useRef(new Map<PlayerId, HTMLElement>());
   const previousCardRects = useRef(new Map<string, DOMRect>());
   const animatedEventIds = useRef(new Set<string>());
-  const hasHydratedEventLog = useRef(false);
+  const animationScope = useRef<string | null>(null);
   const targetMotionTimeout = useRef<number | null>(null);
   const stackMotionTimeout = useRef<number | null>(null);
   const flightCounter = useRef(0);
@@ -149,23 +156,21 @@ export function TableView({
       return;
     }
 
-    if (!hasHydratedEventLog.current) {
-      for (const event of view.eventLog) {
-        animatedEventIds.current.add(event.id);
-      }
-      hasHydratedEventLog.current = true;
-      return;
+    const scope = `${view.roomId}:${currentPlayerId}`;
+    if (animationScope.current !== scope) {
+      animationScope.current = scope;
+      animatedEventIds.current = new Set();
     }
 
     const unseenEvents = view.eventLog.filter((event) => !animatedEventIds.current.has(event.id));
     for (const event of unseenEvents) {
       animatedEventIds.current.add(event.id);
-      animateSharedEvent(event);
+      queueSharedEventAnimation(event);
     }
 
     const visibleIds = new Set(view.eventLog.map((event) => event.id));
     animatedEventIds.current = new Set([...animatedEventIds.current].filter((eventId) => visibleIds.has(eventId)));
-  }, [view?.eventLog, view?.version]);
+  }, [view?.eventLog, view?.version, view?.roomId, currentPlayerId]);
 
   const legal = useMemo(() => {
     return new Set(view?.legalActions.map((action) => action.type) ?? []);
@@ -261,6 +266,12 @@ export function TableView({
     setTemporaryTargetMotions(motions, duration);
   }
 
+  function queueSharedEventAnimation(event: GameEvent) {
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => animateSharedEvent(event));
+    });
+  }
+
   function markSwapTargets(targets: [CardTarget, CardTarget]) {
     const firstKey = targetKey(targets[0]);
     const secondKey = targetKey(targets[1]);
@@ -293,11 +304,11 @@ export function TableView({
   }
 
   function animateFlight(fromNode: Element | null | undefined, toNode: Element | null | undefined, className: string) {
-    if (!fromNode || !toNode || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    if (!fromNode || !toNode) {
       return;
     }
-    const fromRect = fromNode.getBoundingClientRect();
-    const toRect = toNode.getBoundingClientRect();
+    const fromRect = motionRectForNode(fromNode);
+    const toRect = motionRectForNode(toNode);
     const id = `flight-${flightCounter.current++}`;
     const flight: FlightMotion = {
       id,
@@ -315,6 +326,39 @@ export function TableView({
     window.setTimeout(() => {
       setFlightMotions((current) => current.filter((candidate) => candidate.id !== id));
     }, 780);
+  }
+
+  function motionRectForNode(node: Element): MotionRect {
+    const cardNode = node.matches(".playing-card") ? node : node.querySelector(".playing-card, .empty-card-slot");
+    if (cardNode) {
+      const rect = cardNode.getBoundingClientRect();
+      return {
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height
+      };
+    }
+
+    const fallbackSize = fallbackCardSize();
+    const rect = node.getBoundingClientRect();
+    return {
+      left: rect.left + rect.width / 2 - fallbackSize.width / 2,
+      top: rect.top + rect.height / 2 - fallbackSize.height / 2,
+      width: fallbackSize.width,
+      height: fallbackSize.height
+    };
+  }
+
+  function fallbackCardSize(): { width: number; height: number } {
+    const sample =
+      stackRefs.current.get("deck")?.querySelector(".playing-card") ??
+      targetRefs.current.values().next().value?.querySelector(".playing-card, .empty-card-slot");
+    if (sample) {
+      const rect = sample.getBoundingClientRect();
+      return { width: rect.width, height: rect.height };
+    }
+    return { width: 72, height: 101 };
   }
 
   function targetNode(target: CardTarget): HTMLButtonElement | undefined {

@@ -48,7 +48,7 @@ export function getPlayerView(state: GameState, playerId: PlayerId): PlayerView 
     roundNumber: state.roundNumber,
     lastPlayedSeq: state.lastPlayed && !state.lastPlayed.closed ? state.lastPlayed.seq : null,
     jamioCallerId: state.jamio?.callerId ?? null,
-    eventLog: state.eventLog.slice(-12),
+    eventLog: state.eventLog.slice(-24),
     roundWinnerId: state.roundWinnerId,
     gameWinnerId: state.gameWinnerId
   };
