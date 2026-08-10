@@ -43,6 +43,7 @@ type RoomRecord = {
   hostPlayerId: PlayerId;
   players: RoomPlayer[];
   gameState: GameState | null;
+  processedActionIds?: Record<PlayerId, string[]>;
   createdAt: number;
   updatedAt: number;
 };
@@ -51,6 +52,7 @@ const roomKey = "room";
 const maxRestBodyBytes = 64 * 1024;
 const maxSocketMessageBytes = 16 * 1024;
 const socketMessageLimit = { max: 36, windowMs: 10_000 };
+const processedActionHistoryLimit = 64;
 const roomExpiry = {
   connectedCheckMs: 60 * 60 * 1000,
   disconnectedLobbyMs: 30 * 60 * 1000,
@@ -207,6 +209,7 @@ export class JamioRoom {
         hostPlayerId: host.id,
         players: [host],
         gameState: null,
+        processedActionIds: {},
         createdAt: Date.now(),
         updatedAt: Date.now()
       };
@@ -276,6 +279,8 @@ export class JamioRoom {
   }
 
   private async handleSocketMessage(socket: WebSocket, raw: unknown): Promise<void> {
+    let clientActionId: string | undefined;
+    let authenticatedPlayerId: PlayerId | undefined;
     try {
       if (typeof raw !== "string") {
         send(socket, { type: "error", code: "INVALID_MESSAGE", message: "Message must be text" });
@@ -292,6 +297,7 @@ export class JamioRoom {
         return;
       }
       const message = ClientMessageSchema.parse(JSON.parse(raw));
+      clientActionId = message.type === "game_action" ? message.clientActionId : undefined;
       const room = this.requireRoom();
 
       if (message.type === "ping") {
@@ -318,32 +324,57 @@ export class JamioRoom {
 
       const playerId = this.sessions.get(socket);
       if (!playerId) {
-        send(socket, { type: "error", code: "AUTH_REQUIRED", message: "Join the room before sending actions" });
+        send(socket, { type: "error", code: "AUTH_REQUIRED", message: "Join the room before sending actions", clientActionId });
+        return;
+      }
+      authenticatedPlayerId = playerId;
+
+      if (this.hasProcessedAction(room, playerId, message.clientActionId)) {
+        send(socket, this.snapshotFor(playerId, message.clientActionId));
         return;
       }
 
       const expectedVersion = room.gameState?.version ?? 0;
-      if (message.expectedStateVersion !== expectedVersion) {
-        send(socket, {
-          type: "error",
-          code: "STALE_STATE",
-          message: "Your client state is stale",
-          stateVersion: expectedVersion
-        });
+      const isCurrentDiscardAttempt =
+        message.action.type === "attempt_discard" &&
+        room.gameState?.lastPlayed?.seq === message.action.lastPlayedSeq;
+      if (message.expectedStateVersion !== expectedVersion && !isCurrentDiscardAttempt) {
+        await this.rejectGameAction(
+          socket,
+          room,
+          playerId,
+          message.clientActionId,
+          "STALE_STATE",
+          "The game changed before that action. Your view has been refreshed."
+        );
         return;
       }
 
       if (message.action.type === "restart_game") {
         if (playerId !== room.hostPlayerId) {
-          send(socket, { type: "error", code: "NOT_HOST", message: "Only the host can restart the game" });
+          await this.rejectGameAction(socket, room, playerId, message.clientActionId, "NOT_HOST", "Only the host can restart the game");
           return;
         }
         if (room.gameState && room.gameState.phase !== "game_over") {
-          send(socket, { type: "error", code: "INVALID_PHASE", message: "The game can only restart after game over" });
+          await this.rejectGameAction(
+            socket,
+            room,
+            playerId,
+            message.clientActionId,
+            "INVALID_PHASE",
+            "The game can only restart after game over"
+          );
           return;
         }
         if (room.players.length < 2) {
-          send(socket, { type: "error", code: "NOT_ENOUGH_PLAYERS", message: "Jamio needs at least two players" });
+          await this.rejectGameAction(
+            socket,
+            room,
+            playerId,
+            message.clientActionId,
+            "NOT_ENOUGH_PLAYERS",
+            "Jamio needs at least two players"
+          );
           return;
         }
         const players = room.players.map(({ id, name }) => ({ id, name }));
@@ -354,11 +385,18 @@ export class JamioRoom {
         room.gameState.phase = "initial_countdown";
       } else if (!room.gameState && message.action.type === "start_game") {
         if (playerId !== room.hostPlayerId) {
-          send(socket, { type: "error", code: "NOT_HOST", message: "Only the host can start the game" });
+          await this.rejectGameAction(socket, room, playerId, message.clientActionId, "NOT_HOST", "Only the host can start the game");
           return;
         }
         if (room.players.length < 2) {
-          send(socket, { type: "error", code: "NOT_ENOUGH_PLAYERS", message: "Jamio needs at least two players" });
+          await this.rejectGameAction(
+            socket,
+            room,
+            playerId,
+            message.clientActionId,
+            "NOT_ENOUGH_PLAYERS",
+            "Jamio needs at least two players"
+          );
           return;
         }
         const players = room.players.map(({ id, name }) => ({ id, name }));
@@ -373,23 +411,43 @@ export class JamioRoom {
           room.gameState.phase = "initial_countdown";
         }
       } else {
-        send(socket, { type: "error", code: "GAME_NOT_STARTED", message: "The game has not started yet" });
+        await this.rejectGameAction(
+          socket,
+          room,
+          playerId,
+          message.clientActionId,
+          "GAME_NOT_STARTED",
+          "The game has not started yet"
+        );
         return;
       }
 
       room.updatedAt = Date.now();
+      this.rememberProcessedAction(room, playerId, message.clientActionId);
       await this.persist();
-      await this.broadcastSnapshots();
+      await this.broadcastSnapshots({ playerId, clientActionId: message.clientActionId });
       if (room.gameState.phase === "initial_countdown") {
         this.scheduleInitialSequence();
       }
       this.schedulePowerRevealTimeout();
     } catch (error) {
+      if (clientActionId && authenticatedPlayerId && this.room) {
+        await this.rejectGameAction(
+          socket,
+          this.room,
+          authenticatedPlayerId,
+          clientActionId,
+          "ACTION_REJECTED",
+          error instanceof Error ? error.message : "Action was rejected"
+        );
+        return;
+      }
       send(socket, {
         type: "error",
         code: "ACTION_REJECTED",
         message: error instanceof Error ? error.message : "Action was rejected",
-        stateVersion: this.room?.gameState?.version
+        stateVersion: this.room?.gameState?.version,
+        clientActionId
       });
     }
   }
@@ -410,11 +468,12 @@ export class JamioRoom {
     }
   }
 
-  private snapshotFor(playerId: PlayerId): ServerMessage {
+  private snapshotFor(playerId: PlayerId, acknowledgedClientActionId?: string): ServerMessage {
     return {
       type: "snapshot",
       view: this.viewFor(playerId),
-      stateVersion: this.room?.gameState?.version ?? 0
+      stateVersion: this.room?.gameState?.version ?? 0,
+      ...(acknowledgedClientActionId ? { acknowledgedClientActionId } : {})
     };
   }
 
@@ -453,9 +512,12 @@ export class JamioRoom {
     };
   }
 
-  private async broadcastSnapshots(): Promise<void> {
+  private async broadcastSnapshots(acknowledgement?: { playerId: PlayerId; clientActionId: string }): Promise<void> {
     for (const [socket, playerId] of this.sessions) {
-      send(socket, this.snapshotFor(playerId));
+      const acknowledgedClientActionId = acknowledgement?.playerId === playerId
+        ? acknowledgement.clientActionId
+        : undefined;
+      send(socket, this.snapshotFor(playerId, acknowledgedClientActionId));
     }
   }
 
@@ -545,6 +607,46 @@ export class JamioRoom {
     return room.players.find((player) => player.token === token) ?? null;
   }
 
+  private hasProcessedAction(room: RoomRecord, playerId: PlayerId, clientActionId: string): boolean {
+    return room.processedActionIds?.[playerId]?.includes(clientActionId) ?? false;
+  }
+
+  private rememberProcessedAction(room: RoomRecord, playerId: PlayerId, clientActionId: string): void {
+    room.processedActionIds ??= {};
+    const actionIds = room.processedActionIds[playerId] ?? [];
+    room.processedActionIds[playerId] = [...actionIds, clientActionId].slice(-processedActionHistoryLimit);
+  }
+
+  private async rejectGameAction(
+    socket: WebSocket,
+    room: RoomRecord,
+    playerId: PlayerId,
+    clientActionId: string,
+    code: string,
+    message: string
+  ): Promise<void> {
+    this.rememberProcessedAction(room, playerId, clientActionId);
+    try {
+      await this.persist();
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: "action_receipt_persist_failed",
+        roomCode: room.roomCode,
+        playerId,
+        clientActionId,
+        error: error instanceof Error ? error.message : String(error)
+      }));
+    }
+    send(socket, {
+      type: "error",
+      code,
+      message,
+      stateVersion: room.gameState?.version ?? 0,
+      clientActionId
+    });
+    send(socket, this.snapshotFor(playerId, clientActionId));
+  }
+
   private requireRoom(): RoomRecord {
     if (!this.room) {
       throw new Error("Room does not exist");
@@ -554,8 +656,10 @@ export class JamioRoom {
 
   private async persist(): Promise<void> {
     if (this.room) {
-      await this.state.storage.put(roomKey, this.room);
-      await this.state.storage.setAlarm(nextRoomExpiryCheckAt(this.room));
+      await Promise.all([
+        this.state.storage.put(roomKey, this.room),
+        this.state.storage.setAlarm(nextRoomExpiryCheckAt(this.room))
+      ]);
     }
   }
 

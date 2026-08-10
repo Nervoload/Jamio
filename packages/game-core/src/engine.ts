@@ -359,7 +359,7 @@ function canAttemptDiscard(state: GameState, playerId: PlayerId): boolean {
   if (!state.lastPlayed || state.lastPlayed.closed) {
     return false;
   }
-  if (state.phase === "round_reveal" || state.phase === "game_over" || state.phase === "initial_countdown") {
+  if (!isDiscardWindowPhase(state.phase)) {
     return false;
   }
   if (!state.ruleset.general.canDiscardOnOwnTurn && state.currentTurnPlayerId === playerId) {
@@ -375,8 +375,20 @@ function attemptDiscard(
   handSlotId: HandSlotId,
   lastPlayedSeq: number
 ): void {
-  assertJamio(canAttemptDiscard(state, actorId), "Discard is not allowed now", "DISCARD_NOT_ALLOWED");
   assertJamio(state.lastPlayed?.seq === lastPlayedSeq, "Discard window is stale", "STALE_DISCARD_WINDOW");
+
+  if (state.lastPlayed.closed) {
+    assertJamio(isDiscardWindowPhase(state.phase), "Discard is not allowed now", "DISCARD_NOT_ALLOWED");
+    drawMistakePenalty(state, actorId);
+    addEvent(state, "discard_late", `${playerName(state, actorId)} was too late to discard`, actorId, undefined, {
+      target: { playerId: targetPlayerId, slotId: handSlotId },
+      targetPlayerId,
+      source: "hand"
+    });
+    return;
+  }
+
+  assertJamio(canAttemptDiscard(state, actorId), "Discard is not allowed now", "DISCARD_NOT_ALLOWED");
 
   const target = findOccupiedHandCard(state, targetPlayerId, handSlotId);
   const targetCard = getCard(state, target.handCard.cardId);
@@ -385,7 +397,9 @@ function attemptDiscard(
 
   if (targetPlayerId === actorId) {
     if (isCorrect) {
-      removeHandCard(state, targetPlayerId, handSlotId);
+      const discarded = removeHandCard(state, targetPlayerId, handSlotId);
+      state.discardPile.push(discarded.cardId);
+      state.lastPlayed.closed = true;
       addEvent(state, "discard_correct", `${playerName(state, actorId)} discarded their own ${targetRule.matchGroup}`, actorId, undefined, {
         target: { playerId: targetPlayerId, slotId: handSlotId },
         targetPlayerId,
@@ -405,7 +419,9 @@ function attemptDiscard(
   }
 
   if (isCorrect) {
-    removeHandCard(state, targetPlayerId, handSlotId);
+    const discarded = removeHandCard(state, targetPlayerId, handSlotId);
+    state.discardPile.push(discarded.cardId);
+    state.lastPlayed.closed = true;
     addEvent(
       state,
       "opponent_discard_correct",
@@ -437,6 +453,17 @@ function attemptDiscard(
     targetPlayerId,
     source: "hand"
   });
+}
+
+function isDiscardWindowPhase(phase: GamePhase): boolean {
+  return ![
+    "lobby",
+    "round_setup",
+    "initial_countdown",
+    "initial_memorize",
+    "round_reveal",
+    "game_over"
+  ].includes(phase);
 }
 
 function resolveDiscardReward(state: GameState, actorId: PlayerId, handSlotId: HandSlotId): void {
@@ -529,6 +556,17 @@ function maybeTriggerPowerOrAdvance(
     return;
   }
 
+  if (!hasAvailablePowerChoice(state, actorId, rule.power)) {
+    addEvent(
+      state,
+      "power_skipped",
+      `${playerName(state, actorId)} had no valid targets for ${powerName(rule.power)}`,
+      actorId
+    );
+    advanceTurn(state, actorId);
+    return;
+  }
+
   state.pendingPower = {
     actorId,
     cardId,
@@ -552,6 +590,7 @@ function resolvePower(state: GameState, actorId: PlayerId, choice: PowerChoice):
   }
 
   if (choice.type === "cancel") {
+    addEvent(state, "power_skipped", `${playerName(state, actorId)} skipped ${powerName(power)}`, actorId);
     state.pendingPower = null;
     advanceTurn(state, actorId);
     return;
@@ -713,6 +752,39 @@ function isViewingLookPower(pending: NonNullable<GameState["pendingPower"]>): bo
     (pending.power.type === "self_look" || pending.power.type === "look" || pending.power.type === "universal_look" || pending.power.type === "look_swap") &&
     Boolean(pending.revealedTargets?.length)
   );
+}
+
+function hasAvailablePowerChoice(state: GameState, actorId: PlayerId, power: CardPower): boolean {
+  const activePlayerIds = new Set(activePlayers(state).map((player) => player.id));
+  const ownCardCount = occupiedHandCards(state, actorId).length;
+  const opponentCardCount = state.players.reduce((count, player) => {
+    if (player.id === actorId || !activePlayerIds.has(player.id)) {
+      return count;
+    }
+    return count + occupiedHandCards(state, player.id).length;
+  }, 0);
+  const totalCardCount = ownCardCount + opponentCardCount;
+  const hasActiveOpponent = state.players.some((player) => player.active && player.id !== actorId);
+
+  switch (power.type) {
+    case "swap":
+    case "look_swap":
+      return totalCardCount >= 2;
+    case "self_look":
+      return power.count > 0 && ownCardCount > 0;
+    case "look":
+      return power.count > 0 && opponentCardCount > 0;
+    case "universal_look":
+    case "burn":
+      return power.count > 0 && totalCardCount > 0;
+    case "give":
+      return power.count > 0 && hasActiveOpponent;
+    case "donate":
+      return power.count > 0 && ownCardCount > 0 && hasActiveOpponent;
+    case "draw":
+    case "emote":
+      return true;
+  }
 }
 
 function finishViewedPower(state: GameState, actorId: PlayerId, shouldSwap: boolean): void {

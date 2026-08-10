@@ -1,4 +1,13 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type RefCallback } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
+  type RefCallback
+} from "react";
 import type { CardPower, CardTarget, GameAction, GameEvent, Player, PlayerId, PlayerView, PublicCard } from "@jamio/game-core";
 import { Card } from "../components/Card";
 import { RoomCodeBadge } from "../components/RoomCodeBadge";
@@ -24,7 +33,15 @@ type SelectionMode =
   | "donate_cards";
 
 const doubleTapWindowMs = 420;
+const discardDragThresholdPx = 40;
 const lookRevealTimeoutMs = 30_000;
+
+type PendingCardTap = {
+  key: string;
+  at: number;
+  timeoutId: number;
+  activate: (() => void) | null;
+};
 
 type TargetMotion = {
   className: string;
@@ -70,7 +87,6 @@ export function TableView({
   const [mode, setMode] = useState<SelectionMode>("none");
   const [selectedTargets, setSelectedTargets] = useState<CardTarget[]>([]);
   const [donateTargetId, setDonateTargetId] = useState<PlayerId | null>(null);
-  const [lastTap, setLastTap] = useState<{ key: string; at: number } | null>(null);
   const [targetMotions, setTargetMotions] = useState<Record<string, TargetMotion>>({});
   const [stackMotion, setStackMotion] = useState<"deck" | "discard" | null>(null);
   const [flightMotions, setFlightMotions] = useState<FlightMotion[]>([]);
@@ -84,6 +100,8 @@ export function TableView({
   const targetMotionTimeout = useRef<number | null>(null);
   const stackMotionTimeout = useRef<number | null>(null);
   const flightCounter = useRef(0);
+  const pendingCardTap = useRef<PendingCardTap | null>(null);
+  const selectedTargetsRef = useRef<CardTarget[]>([]);
 
   const currentPlayer = session.players.find((player) => player.id === currentPlayerId) ?? session.players[0]!;
   const isOnline = session.kind === "online";
@@ -98,7 +116,9 @@ export function TableView({
   const publicEventMotions = useMemo(() => latestPublicEventMotions(view), [eventLogSignature, view]);
 
   useEffect(() => {
+    clearPendingCardTap();
     setSelectedTargets([]);
+    selectedTargetsRef.current = [];
     setDonateTargetId(null);
     const prompt = view?.pendingPrompt;
     if (prompt?.type === "resolve_power" && isTargetingPower(prompt.power) && !prompt.revealedTargets?.length) {
@@ -111,6 +131,10 @@ export function TableView({
     }
     setMode("none");
   }, [currentPlayerId, view?.phase, view?.version]);
+
+  useEffect(() => {
+    return () => clearPendingCardTap();
+  }, []);
 
   useEffect(() => {
     if (!isViewingPower) {
@@ -464,10 +488,24 @@ export function TableView({
   }
 
   function dispatch(action: GameAction) {
+    clearPendingCardTap();
     setMode("none");
     setSelectedTargets([]);
+    selectedTargetsRef.current = [];
     setDonateTargetId(null);
     onAction(action);
+  }
+
+  function clearPendingCardTap(activate = false) {
+    const pending = pendingCardTap.current;
+    if (!pending) {
+      return;
+    }
+    window.clearTimeout(pending.timeoutId);
+    pendingCardTap.current = null;
+    if (activate) {
+      pending.activate?.();
+    }
   }
 
   function handleCardClick(target: CardTarget) {
@@ -496,7 +534,8 @@ export function TableView({
     }
 
     if (power.type === "donate" && mode === "donate_cards" && target.playerId === currentPlayerId) {
-      const nextTargets = toggleTarget(selectedTargets, target).slice(0, power.count);
+      const nextTargets = toggleTarget(selectedTargetsRef.current, target).slice(0, power.count);
+      selectedTargetsRef.current = nextTargets;
       setSelectedTargets(nextTargets);
       if (donateTargetId && nextTargets.length >= getRequiredTargetCount(power, currentPlayerId, allCardTargets)) {
         markTargets(nextTargets, "is-donating");
@@ -517,7 +556,8 @@ export function TableView({
     }
 
     const maxTargets = getPowerTargetCount(power);
-    const nextTargets = toggleTarget(selectedTargets, target).slice(0, maxTargets);
+    const nextTargets = toggleTarget(selectedTargetsRef.current, target).slice(0, maxTargets);
+    selectedTargetsRef.current = nextTargets;
     setSelectedTargets(nextTargets);
 
     if (nextTargets.length >= getRequiredTargetCount(power, currentPlayerId, allCardTargets)) {
@@ -525,15 +565,41 @@ export function TableView({
     }
   }
 
-  function handleCardTap(target: CardTarget) {
+  function handleCardTap(target: CardTarget, activate: boolean) {
     const key = `${target.playerId}:${target.slotId}`;
     const now = Date.now();
-    if (lastTap?.key === key && now - lastTap.at < doubleTapWindowMs) {
-      attemptDiscard(target);
-      setLastTap(null);
+    const canDiscard = Boolean(view?.lastPlayedSeq && legal.has("attempt_discard"));
+    const pending = pendingCardTap.current;
+
+    if (!canDiscard) {
+      clearPendingCardTap();
+      if (activate) {
+        handleCardClick(target);
+      }
       return;
     }
-    setLastTap({ key, at: now });
+
+    if (pending?.key === key && now - pending.at < doubleTapWindowMs) {
+      clearPendingCardTap();
+      attemptDiscard(target);
+      return;
+    }
+
+    clearPendingCardTap(true);
+    const nextPending: PendingCardTap = {
+      key,
+      at: now,
+      timeoutId: 0,
+      activate: activate ? () => handleCardClick(target) : null
+    };
+    nextPending.timeoutId = window.setTimeout(() => {
+      if (pendingCardTap.current !== nextPending) {
+        return;
+      }
+      pendingCardTap.current = null;
+      nextPending.activate?.();
+    }, doubleTapWindowMs);
+    pendingCardTap.current = nextPending;
   }
 
   function attemptDiscard(target: CardTarget) {
@@ -610,7 +676,7 @@ export function TableView({
   }
 
   return (
-    <main className={tableScreenClass(session.table.theme)}>
+    <main className={`${tableScreenClass(session.table.theme)} is-game-active`}>
       {latestEmote ? <div className="emote-overlay" aria-live="polite">{latestEmote.message.replace(/^.* played /, "")}</div> : null}
 
       <header className="table-topbar">
@@ -674,8 +740,9 @@ export function TableView({
                         motionStyle={cardButtonStyle(handCard.slotId, motion?.style)}
                         targetRef={registerTargetElement(target)}
                         cardMotionRef={registerCardMotionElement(handCard.empty ? null : handCard.card)}
-                        onClick={handleCardClick}
                         onTap={handleCardTap}
+                        onDragDiscard={attemptDiscard}
+                        canAttemptDiscard={Boolean(view.lastPlayedSeq && legal.has("attempt_discard"))}
                       />
                     );
                   })}
@@ -727,6 +794,7 @@ export function TableView({
           onDonateTargetChange={(playerId) => {
             setDonateTargetId(playerId);
             setSelectedTargets([]);
+            selectedTargetsRef.current = [];
             setMode("donate_cards");
           }}
           onFinishViewedPower={finishViewedPower}
@@ -759,8 +827,9 @@ export function TableView({
                   motionStyle={cardButtonStyle(handCard.slotId, motion?.style)}
                   targetRef={registerTargetElement(target)}
                   cardMotionRef={registerCardMotionElement(handCard.empty ? null : handCard.card)}
-                  onClick={handleCardClick}
                   onTap={handleCardTap}
+                  onDragDiscard={attemptDiscard}
+                  canAttemptDiscard={Boolean(view.lastPlayedSeq && legal.has("attempt_discard"))}
                 />
               );
             })}
@@ -1051,7 +1120,13 @@ function ActionPanel({
                 End Turn
               </button>
             </div>
-          ) : null}
+          ) : (
+            <div className="inline-actions">
+              <button type="button" onClick={() => onAction({ type: "resolve_power", choice: { type: "cancel" } })}>
+                End Turn
+              </button>
+            </div>
+          )}
         </div>
       ) : null}
 
@@ -1133,8 +1208,9 @@ type CardButtonProps = {
   motionStyle?: (CSSProperties & Partial<Record<"--move-x" | "--move-y", string>>) | undefined;
   targetRef: RefCallback<HTMLButtonElement>;
   cardMotionRef: RefCallback<HTMLButtonElement>;
-  onClick: (target: CardTarget) => void;
-  onTap: (target: CardTarget) => void;
+  onTap: (target: CardTarget, activate: boolean) => void;
+  onDragDiscard: (target: CardTarget) => void;
+  canAttemptDiscard: boolean;
 };
 
 function CardButton({
@@ -1147,27 +1223,111 @@ function CardButton({
   motionStyle,
   targetRef,
   cardMotionRef,
-  onClick,
-  onTap
+  onTap,
+  onDragDiscard,
+  canAttemptDiscard
 }: CardButtonProps) {
+  const pointerStart = useRef<{ pointerId: number; x: number; y: number; discarded: boolean } | null>(null);
+  const suppressClick = useRef(false);
+  const pointerCleanup = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    return () => pointerCleanup.current?.();
+  }, []);
+
+  function processPointerMove(event: PointerEvent, node: HTMLButtonElement) {
+    const start = pointerStart.current;
+    if (!start || start.pointerId !== event.pointerId || start.discarded || !canAttemptDiscard) {
+      return;
+    }
+    const deltaX = event.clientX - start.x;
+    const deltaY = event.clientY - start.y;
+    const threshold = Math.max(discardDragThresholdPx, node.offsetHeight * 0.28);
+    if (deltaY <= -threshold && Math.abs(deltaY) >= Math.abs(deltaX) * 0.8) {
+      start.discarded = true;
+      suppressClick.current = true;
+      event.preventDefault();
+      onDragDiscard(target);
+    }
+  }
+
+  function handlePointerDown(event: ReactPointerEvent<HTMLButtonElement>) {
+    if (empty || !event.isPrimary) {
+      return;
+    }
+    suppressClick.current = false;
+    pointerStart.current = {
+      pointerId: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      discarded: false
+    };
+    const node = event.currentTarget;
+    node.setPointerCapture(event.pointerId);
+
+    const handleMove = (pointerEvent: PointerEvent) => processPointerMove(pointerEvent, node);
+    const finishGesture = (pointerEvent: PointerEvent) => {
+      if (pointerEvent.pointerId !== event.pointerId) {
+        return;
+      }
+      processPointerMove(pointerEvent, node);
+      pointerStart.current = null;
+      if (node.hasPointerCapture(pointerEvent.pointerId)) {
+        node.releasePointerCapture(pointerEvent.pointerId);
+      }
+      pointerCleanup.current?.();
+    };
+    const cancelGesture = (pointerEvent: PointerEvent) => {
+      if (pointerEvent.pointerId !== event.pointerId) {
+        return;
+      }
+      pointerStart.current = null;
+      suppressClick.current = false;
+      if (node.hasPointerCapture(pointerEvent.pointerId)) {
+        node.releasePointerCapture(pointerEvent.pointerId);
+      }
+      pointerCleanup.current?.();
+    };
+
+    window.addEventListener("pointermove", handleMove, { passive: false });
+    window.addEventListener("pointerup", finishGesture);
+    window.addEventListener("pointercancel", cancelGesture);
+    pointerCleanup.current = () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", finishGesture);
+      window.removeEventListener("pointercancel", cancelGesture);
+      pointerCleanup.current = null;
+    };
+  }
+
+  function handleLostPointerCapture() {
+    if (pointerStart.current?.discarded) {
+      pointerStart.current = null;
+      pointerCleanup.current?.();
+    }
+  }
+
   return (
     <button
       ref={(node) => {
         targetRef(node);
         cardMotionRef(empty ? null : node);
       }}
-      className={`card-button ${empty ? "is-empty-slot" : ""} ${selectable && !empty ? "is-selectable" : ""} ${selected ? "is-selected" : ""} ${motionClassName ?? ""}`}
+      className={`card-button ${empty ? "is-empty-slot" : ""} ${canAttemptDiscard && !empty ? "can-discard" : ""} ${selectable && !empty ? "is-selectable" : ""} ${selected ? "is-selected" : ""} ${motionClassName ?? ""}`}
       style={motionStyle}
       type="button"
+      aria-label={card?.label ?? "Hidden card"}
+      onPointerDown={handlePointerDown}
+      onLostPointerCapture={handleLostPointerCapture}
       onClick={() => {
         if (empty) {
           return;
         }
-        if (selectable) {
-          onClick(target);
+        if (suppressClick.current) {
+          suppressClick.current = false;
           return;
         }
-        onTap(target);
+        onTap(target, selectable);
       }}
     >
       {empty ? <span className="empty-card-slot" /> : <Card card={card} />}

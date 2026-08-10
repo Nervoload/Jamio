@@ -93,6 +93,20 @@ function occupiedCount(state: GameState, playerId: PlayerId): number {
   return state.hands[playerId]!.filter((handCard) => handCard.cardId).length;
 }
 
+function emptyHand(state: GameState, playerId: PlayerId, cardsToKeep = 0): void {
+  for (const handCard of state.hands[playerId]!.slice(cardsToKeep)) {
+    handCard.cardId = null;
+    handCard.visibleTo = [];
+  }
+}
+
+function startFinalTurnAfterPlayerEmptiesHand(state: GameState): void {
+  emptyHand(state, "p1");
+  state.jamio = { callerId: "p1", remainingPlayerIds: ["p2"] };
+  state.currentTurnPlayerId = "p2";
+  state.phase = "jamio_final_cycle";
+}
+
 describe("Jamio game engine", () => {
   it("deals unique cards", () => {
     const state = makeState();
@@ -203,6 +217,54 @@ describe("Jamio game engine", () => {
     expect(getPlayerView(state, "p1").opponentHands[0]!.cards[0]!.card).toBeNull();
   });
 
+  it.each(["8S", "9S"] as const)("skips %s look when every opponent has no cards", (lookCardId) => {
+    let state = makeState(`no-look-target-${lookCardId}`);
+    startFinalTurnAfterPlayerEmptiesHand(state);
+    putCardOnDeckTop(state, lookCardId);
+
+    state = applyAction(state, "p2", { type: "draw_from_deck" }).state;
+    const playResult = applyAction(state, "p2", { type: "play_drawn_card" });
+    state = playResult.state;
+
+    expect(state.pendingPower).toBeNull();
+    expect(state.phase).toBe("round_reveal");
+    expect(state.roundWinnerId).toBe("p1");
+    expect(playResult.events.find((event) => event.type === "power_skipped")).toMatchObject({ actorId: "p2" });
+  });
+
+  it("skips a swap when fewer than two occupied cards remain", () => {
+    let state = makeState("no-swap-targets");
+    startFinalTurnAfterPlayerEmptiesHand(state);
+    emptyHand(state, "p2", 1);
+    putCardOnDeckTop(state, "10S");
+
+    state = applyAction(state, "p2", { type: "draw_from_deck" }).state;
+    const playResult = applyAction(state, "p2", { type: "play_drawn_card" });
+    state = playResult.state;
+
+    expect(state.pendingPower).toBeNull();
+    expect(state.phase).toBe("round_reveal");
+    expect(playResult.events.some((event) => event.type === "power_skipped")).toBe(true);
+  });
+
+  it("lets a player end an available power without using it", () => {
+    let state = makeState("skip-optional-power");
+    state.currentTurnPlayerId = "p1";
+    putCardOnDeckTop(state, "9S");
+
+    state = applyAction(state, "p1", { type: "draw_from_deck" }).state;
+    state = applyAction(state, "p1", { type: "play_drawn_card" }).state;
+    expect(state.phase).toBe("resolving_power");
+
+    const skipResult = applyAction(state, "p1", { type: "resolve_power", choice: { type: "cancel" } });
+    state = skipResult.state;
+
+    expect(state.pendingPower).toBeNull();
+    expect(state.phase).toBe("turn_idle");
+    expect(state.currentTurnPlayerId).toBe("p2");
+    expect(skipResult.events.find((event) => event.type === "power_skipped")).toMatchObject({ actorId: "p1" });
+  });
+
   it("look and swap reveals before swapping selected cards", () => {
     let state = makeState("look-swap");
     state.currentTurnPlayerId = "p1";
@@ -309,6 +371,59 @@ describe("Jamio game engine", () => {
 
     expect(occupiedCount(state, "p1")).toBe(startingCount - 1);
     expect(state.hands.p1!.find((card) => card.slotId === targetSlot)?.cardId).toBeNull();
+    expect(state.discardPile.at(-1)).toBe("AS");
+    expect(state.lastPlayed?.closed).toBe(true);
+  });
+
+  it("allows only the first successful discard and penalizes a later attempt for the same card", () => {
+    let state = makeState("discard-race");
+    const firstSlot = slot(state, "p1");
+    const lateSlot = slot(state, "p2");
+    putCardInSlot(state, "p1", firstSlot, "AS");
+    putCardInSlot(state, "p2", lateSlot, "AD");
+    openDiscardWindow(state, "AH", "A");
+    const playedSeq = state.lastPlayedSeq;
+
+    state = applyAction(state, "p1", {
+      type: "attempt_discard",
+      targetPlayerId: "p1",
+      handSlotId: firstSlot,
+      lastPlayedSeq: playedSeq
+    }).state;
+    const latePlayerCount = occupiedCount(state, "p2");
+
+    const lateResult = applyAction(state, "p2", {
+      type: "attempt_discard",
+      targetPlayerId: "p2",
+      handSlotId: lateSlot,
+      lastPlayedSeq: playedSeq
+    });
+    state = lateResult.state;
+
+    expect(state.discardPile).toEqual(["AH", "AS"]);
+    expect(state.hands.p2!.find((card) => card.slotId === lateSlot)?.cardId).toBe("AD");
+    expect(occupiedCount(state, "p2")).toBe(latePlayerCount + 1);
+    expect(lateResult.events.map((event) => event.type)).toEqual(["penalty_draw", "discard_late"]);
+  });
+
+  it("rejects late discard penalties after the round has ended", () => {
+    let state = makeState("discard-after-round");
+    const targetSlot = slot(state, "p2");
+    putCardInSlot(state, "p2", targetSlot, "AS");
+    openDiscardWindow(state, "AH", "A");
+    state.lastPlayed!.closed = true;
+    state.phase = "round_reveal";
+    const startingCount = occupiedCount(state, "p2");
+
+    expect(() =>
+      applyAction(state, "p2", {
+        type: "attempt_discard",
+        targetPlayerId: "p2",
+        handSlotId: targetSlot,
+        lastPlayedSeq: state.lastPlayedSeq
+      })
+    ).toThrow("Discard is not allowed now");
+    expect(occupiedCount(state, "p2")).toBe(startingCount);
   });
 
   it("incorrect own discard adds penalty card when enabled", () => {

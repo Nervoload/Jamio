@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ClientMessageSchema, CreateRoomRequestSchema } from "../src";
+import { ClientMessageSchema, CreateRoomRequestSchema, ServerMessageSchema } from "../src";
 
 describe("protocol schemas", () => {
   it("normalizes room codes", () => {
@@ -56,5 +56,31 @@ describe("protocol schemas", () => {
         action: { type: "draw_from_deck" }
       }).success
     ).toBe(false);
+  });
+
+  it("accepts snapshots that acknowledge a processed client action", () => {
+    const parsed = ServerMessageSchema.safeParse({
+      type: "snapshot",
+      view: { version: 4 },
+      stateVersion: 4,
+      acknowledgedClientActionId: "action-4"
+    });
+
+    expect(parsed.success).toBe(true);
+    if (parsed.success && parsed.data.type === "snapshot") {
+      expect(parsed.data.acknowledgedClientActionId).toBe("action-4");
+    }
+  });
+
+  it("accepts action errors that identify the terminal client action", () => {
+    const parsed = ServerMessageSchema.safeParse({
+      type: "error",
+      code: "ACTION_REJECTED",
+      message: "That action is no longer legal",
+      stateVersion: 5,
+      clientActionId: "action-5"
+    });
+
+    expect(parsed.success).toBe(true);
   });
 });

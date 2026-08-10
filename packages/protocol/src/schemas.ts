@@ -125,7 +125,8 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("snapshot"),
     view: z.unknown(),
-    stateVersion: z.number().int().min(0)
+    stateVersion: z.number().int().min(0),
+    acknowledgedClientActionId: z.string().min(1).max(120).optional()
   }),
   z.object({
     type: z.literal("event"),
@@ -143,7 +144,8 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("error"),
     code: z.string().min(1),
     message: z.string().min(1),
-    stateVersion: z.number().int().min(0).optional()
+    stateVersion: z.number().int().min(0).optional(),
+    clientActionId: z.string().min(1).max(120).optional()
   }),
   z.object({ type: z.literal("pong") })
 ]);
